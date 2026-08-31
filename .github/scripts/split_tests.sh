@@ -86,6 +86,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_moe_2stage.py]=107
     FILE_TIMES[op_tests/test_gemm_a8w8.py]=98
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale_cktile_aq_rowmajor.py]=90
+    FILE_TIMES[op_tests/test_fused_moe_router.py]=95
     FILE_TIMES[op_tests/test_activation.py]=88
     FILE_TIMES[op_tests/test_flydsl_qk_norm_rope_quant.py]=83
     FILE_TIMES[op_tests/test_kvcache.py]=59
