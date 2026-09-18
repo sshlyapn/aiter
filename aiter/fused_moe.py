@@ -603,6 +603,12 @@ def fused_moe_router_arch_supported() -> bool:
     return get_gfx() == "gfx950"
 
 
+# Hidden dims phase 1's quant geometry covers: cols == 256 * TD, one vector
+# per thread in a single pass. 4096 is the reference shape, 2048 adds the
+# Solar-35B class.
+FUSED_MOE_ROUTER_HIDDEN_DIMS = (2048, 4096)
+
+
 def fused_moe_router_config_supported(
     hidden_dim: int,
     hidden_dtype: torch.dtype,
@@ -625,7 +631,7 @@ def fused_moe_router_config_supported(
         and GateMode(gate_mode) == GateMode.SEPARATED
         and w1_dtype == dtypes.fp4x2
         and hidden_dtype == dtypes.bf16
-        and hidden_dim == 4096
+        and hidden_dim in FUSED_MOE_ROUTER_HIDDEN_DIMS
         # Phase 1 places the shared rows on the lanes just past topk, within the
         # one wave the top-k selects in. Known without tensors, so it declines
         # once at selection rather than on every forward.

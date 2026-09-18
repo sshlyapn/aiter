@@ -22,10 +22,11 @@ namespace {
 // and no launch ever memsets it; a per-call stream memset would cost more than
 // the barrier it guards.
 //
-// scaleN_pad = pad8(cols / group_size) <= 256: cols is pinned to 4096 and
-// group_size is a multiple of TD == 16. Rows are sized to that bound rather
-// than the call's own scaleN_pad, so a quant-config change cannot resize the
-// workspace either.
+// scaleN_pad = pad8(cols / group_size) <= 256: cols is at most 4096 and
+// group_size is a multiple of TD. 2048 needs half as many scales, so the bound
+// is unchanged and the workspace stays valid for both. Rows are sized to that
+// bound rather than the call's own scaleN_pad, so a quant-config change cannot
+// resize the workspace either.
 static constexpr int kMaxScaleNPad   = 256;
 static constexpr int kTokScaleOffset = 256; // keeps tok_scale 256B-aligned
 } // namespace
@@ -84,7 +85,12 @@ void fused_moe_router_impl(
     const int E    = num_experts;
     const int cols = hidden.size(1);
     constexpr int BlockSize = 256;
-    constexpr int TD        = 16; // cols / TD must equal BlockSize
+    // Phase 1's quant geometry: one vector per thread covers the row in a
+    // single pass, so TD is pinned by cols == BlockSize * TD. 4096 -> 16 is the
+    // original reference shape; 2048 -> 8 adds Solar-35B-class hidden sizes.
+    // Both keep the full block active and 16B (dwordx4) loads -- TD counts
+    // bf16 elements, so TD=8 is 16B per thread, one chunk instead of two.
+    const int TD = cols / BlockSize;
     // Instantiated shared-expert counts. Every model that fuses shared experts
     // today has exactly one; a wider ladder is dead template instantiations.
     constexpr int kMaxShared = 1;
@@ -97,7 +103,9 @@ void fused_moe_router_impl(
     TORCH_CHECK(ep_size >= 1 && ep_rank >= 0 && ep_rank < ep_size,
                 "fused_moe_router_impl: need 0 <= ep_rank < ep_size, got ep_rank=",
                 ep_rank, " ep_size=", ep_size);
-    TORCH_CHECK(cols == BlockSize * TD, "fused_moe_router_impl: cols must be ", BlockSize * TD);
+    TORCH_CHECK(cols == BlockSize * 16 || cols == BlockSize * 8,
+                "fused_moe_router_impl: cols must be ", BlockSize * 16, " or ",
+                BlockSize * 8, ", got ", cols);
     // The histogram, the scan and the local-id table are all indexed by emitted
     // expert id, so it is the full slot count -- not the routed count -- that
     // has to fit s_scan's 2*BlockSize slots.
@@ -121,7 +129,8 @@ void fused_moe_router_impl(
     // The phase-3 scatter's hoisted swizzle table is only complete on an aligned
     // column span; a partial span leaves trailing scale columns holding stale
     // allocator memory that is read back as e8m0 exponents. Implied by
-    // cols == BlockSize * TD, checked so the coupling cannot be lost silently.
+    // cols == BlockSize * TD for either TD, checked so the coupling cannot be
+    // lost silently.
     TORCH_CHECK((cols + group_size - 1) / group_size % aiter::fmr::kScalesPerThread == 0,
                 "fused_moe_router_impl: scales per row (ceil(cols/group_size)) must be a "
                 "multiple of ", aiter::fmr::kScalesPerThread, ", got ",
@@ -264,12 +273,13 @@ void fused_moe_router_impl(
     const bool bias_is_f32 = bias.scalar_type() == at::kFloat;
 
     // One body, instantiated per (bias dtype, shared-expert count).
-    auto launch_all = [&](auto bias_tag, auto nshared_tag) {
+    auto launch_all = [&](auto bias_tag, auto nshared_tag, auto td_tag) {
         using DB                = decltype(bias_tag);
         constexpr int NSHARED   = decltype(nshared_tag)::value;
+        constexpr int TDV       = decltype(td_tag)::value;
         const DB* b = reinterpret_cast<const DB*>(bias.data_ptr());
         auto* kern = aiter::fmr::fused_moe_routing_kernel<
-            BlockSize, TD, opus::bf16_t, aiter::fmr::kFused, DB, NSHARED>;
+            BlockSize, TDV, opus::bf16_t, aiter::fmr::kFused, DB, NSHARED>;
         (void)hipFuncSetAttribute(reinterpret_cast<const void*>(kern),
                                   hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
         // The grid barrier deadlocks unless every block is co-resident.
@@ -303,9 +313,9 @@ void fused_moe_router_impl(
         if(split)
         {
             auto* k1 = aiter::fmr::fused_moe_routing_kernel<
-                BlockSize, TD, opus::bf16_t, aiter::fmr::kPhase1, DB, NSHARED>;
+                BlockSize, TDV, opus::bf16_t, aiter::fmr::kPhase1, DB, NSHARED>;
             auto* k23 = aiter::fmr::fused_moe_routing_kernel<
-                BlockSize, TD, opus::bf16_t, aiter::fmr::kPhase23, DB, NSHARED>;
+                BlockSize, TDV, opus::bf16_t, aiter::fmr::kPhase23, DB, NSHARED>;
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k1),
                                       hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k23),
@@ -345,11 +355,21 @@ void fused_moe_router_impl(
     // NSHARED == 0 must reach the same instantiation as before this feature
     // existed, so the shared-expert lanes fold out entirely and the no-shared
     // config keeps its register count.
+    // TD is a template argument, so the runtime value picks an instantiation.
+    // TD == 16 must reach the same one as before 2048 was supported, keeping
+    // the reference path's register count and codegen untouched.
+    auto dispatch_td = [&](auto bias_tag, auto nshared_tag) {
+        if(TD == 16)
+            launch_all(bias_tag, nshared_tag, std::integral_constant<int, 16>{});
+        else
+            launch_all(bias_tag, nshared_tag, std::integral_constant<int, 8>{});
+    };
+
     auto dispatch_shared = [&](auto bias_tag) {
         if(n_shared == 0)
-            launch_all(bias_tag, std::integral_constant<int, 0>{});
+            dispatch_td(bias_tag, std::integral_constant<int, 0>{});
         else
-            launch_all(bias_tag, std::integral_constant<int, 1>{});
+            dispatch_td(bias_tag, std::integral_constant<int, 1>{});
     };
 
     if(bias_is_f32)

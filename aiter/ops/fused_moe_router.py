@@ -52,7 +52,8 @@ def fused_moe_router_impl(
     place and must be preallocated with exactly the shapes the stock path
     produces.
 
-    Constraints checked by the C++ entry: ``hidden.shape[1] == 4096``,
+    Constraints checked by the C++ entry: ``hidden.shape[1]`` in
+    ``(2048, 4096)``,
     ``num_experts <= 512``, ``unit_size`` a power of two, bf16 inputs,
     ``num_expert_group == topk_group == 1``.
 
