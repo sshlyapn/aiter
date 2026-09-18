@@ -601,12 +601,14 @@ def check_rejects_bad_shapes(E=320, topk=8, unit_size=16):
     got = _alloc(ref, M, topk)
     bad = 0
 
-    h_narrow = torch.randn(M, COLS // 2, dtype=dtypes.bf16)
+    # Not COLS // 2: that is a supported hidden dim. This width lands on no
+    # geometry, so the entry must decline rather than quantize a partial row.
+    h_narrow = torch.randn(M, COLS // 4 * 3, dtype=dtypes.bf16)
     bad += _expect_raises(
         lambda: _call_fused(
             g, b, h_narrow, got, E, topk, unit_size, True, 1.0, None, None
         ),
-        f"cols={COLS // 2}",
+        f"cols={COLS // 4 * 3}",
     )
     g_wide = torch.randn(M, 1024, dtype=dtypes.bf16)
     b_wide = torch.randn(1024, dtype=dtypes.bf16)
@@ -671,6 +673,24 @@ def _assert_ok(errs, ctx):
 def test_tokens_and_ep(M, ep):
     errs, _ = _run_case(M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, False)
     _assert_ok(errs, f"M={M} ep={ep}")
+
+
+def test_small_m_all_experts_masked():
+    """M=1 with every routed expert masked out.
+
+    The small-M kernel has no expert that owns the token, so a routing-derived
+    owner would leave out_fp4 unwritten. num_valid is 0 here, so phase 3 emits
+    nothing and only the quant prologue covers the row.
+    """
+    M, E, topk, unit_size = 1, 320, 8, 16
+    mask = torch.zeros(E, dtype=torch.int32)  # this rank owns nothing
+    g, b, h = _inputs(M, E, dtypes.bf16, M)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask)
+    got = _alloc(ref, M, topk)
+    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None)
+    torch.cuda.synchronize()
+    assert int(got["nv"][0].item()) == 0, "no owned expert should route no rows"
+    _assert_ok(_compare(ref, got, M, topk, unit_size), "M=1 all-masked")
 
 
 @pytest.mark.parametrize("unit_size", [16, 32, 64, 128])
@@ -1317,7 +1337,8 @@ def test_config_supported_scalar_gate():
     # the entry TORCH_CHECKs rather than declining.
     assert not ask(num_fused_shared_experts=2)
     assert not ask(num_fused_shared_experts=-1)
-    assert not ask(hidden_dim=2048)
+    assert ask(hidden_dim=2048)
+    assert not ask(hidden_dim=3072)
     assert not ask(hidden_dtype=dtypes.fp16)
     assert not ask(activation=ActivationType.Gelu.value)
     assert not ask(gate_mode=GateMode.INTERLEAVE.value)

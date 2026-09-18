@@ -1505,6 +1505,11 @@ FUSED_MOE_ROUTER_MAX_TOKENS = 128
 FUSED_MOE_ROUTER_MAX_TOPK = 64  # kWaveSize
 FUSED_MOE_ROUTER_MAX_EXPERTS = 512  # 2 * BlockSize
 
+# Hidden dims phase 1's quant geometry covers. 4096 is the reference shape
+# (256 threads x 16 columns, one pass); 2048 is served by a narrower variant
+# selected in the kernel. See fmr_pick_geom in csrc/kernels/fused_moe_router.cu.
+FUSED_MOE_ROUTER_HIDDEN_DIMS = (2048, 4096)
+
 
 def _cfg_topk(topk: int, n_shared: int, expert_mask: torch.Tensor | None) -> int:
     """Tuned-config topk key: the width the unfused path would look up.
@@ -1548,7 +1553,7 @@ def fused_moe_router_config_supported(
         and GateMode(gate_mode) == GateMode.SEPARATED
         and w1_dtype == dtypes.fp4x2
         and hidden_dtype == dtypes.bf16
-        and hidden_dim == 4096
+        and hidden_dim in FUSED_MOE_ROUTER_HIDDEN_DIMS
         # Phase 1 parks the shared rows on the lanes just past topk, within
         # the one wave top-k selects in.
         and 0 <= num_fused_shared_experts <= 1
