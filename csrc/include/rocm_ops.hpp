@@ -1458,7 +1458,8 @@ namespace py = pybind11;
           py::arg("shared_expert_weight")     = 1.0,                           \
           py::arg("ep_rank")                  = 0,                             \
           py::arg("ep_size")                  = 1,                             \
-          "Fused MoE routing preamble: topk + moe_sort + MXFP4 quant.");       \
+          py::arg("quant_type") = static_cast<int64_t>(QuantType::per_1x32),  \
+          "Fused MoE routing preamble: topk + moe_sort + MXFP4 / FP8 quant.");  \
     m.def("fused_moe_router_workspace_size",                                   \
           &aiter::fused_moe_router_workspace_size,                             \
           py::arg("max_tokens"),                                               \

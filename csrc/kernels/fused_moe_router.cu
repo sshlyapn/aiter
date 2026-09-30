@@ -7,14 +7,18 @@
 //
 // Phase 1 -- block owns tokens t = bid, bid+GRID, ..; no cross-block deps
 //   wave 0 : biased-sigmoid top-k -> topk_ids/topk_weights
-//   all    : MXFP4 quant of hidden[t] -> out[t], group e8m0 -> tok_scale[t]
+//   all    : quant of hidden[t] -> out[t]
+//            MXFP4:         group e8m0 -> tok_scale[t]
+//            FP8 per-token: fp32 row scale -> out_scale[t] (final layout)
 // ---- grid barrier (the only one) ----
 // Phase 2 : reload topk into LDS, histogram + scan -> per-expert base offsets.
 //           Redundant in every block on purpose: a few hundred LDS elements is
 //           cheaper than a second grid barrier.
 // Phase 3 : each block takes a unit-aligned slice of the sorted output and per
 //           expert ballot-ranks its routed ids -> sorted_ids/weights/expert_ids,
-//           pads rows, scatters the token's e8m0 scales into swizzled layout.
+//           pads rows; MXFP4 also scatters the token's e8m0 scales into the
+//           swizzled layout. The FP8 per-token GEMMs gather the scale by token
+//           id themselves, so that mode has no scatter.
 
 // Torch-free TU: AITER_NO_TORCH_TYPES must precede any aiter header so the opus
 // includes do not pull in the c10 half/bfloat16 types.
@@ -25,6 +29,7 @@
 #include <type_traits>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include "aiter_enum.h" // QuantType
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
@@ -38,6 +43,27 @@ namespace aiter {
 namespace fmr {
 
 static constexpr int kWaveSize = 64;
+
+// Activation quant modes, keyed by (QuantType, output element type): per_1x32
+// alone is ambiguous between MXFP4 and MXFP8. Any other pair fails to compile.
+template <QuantType QT, typename DTYPE_O>
+inline constexpr bool fmr_quant_supported =
+    (QT == QuantType::per_1x32 && std::is_same_v<DTYPE_O, opus::fp4_t>) ||
+    (QT == QuantType::per_Token && std::is_same_v<DTYPE_O, opus::fp8_t>);
+
+// Dependent false for the terminal branch of a quant-mode if-constexpr chain,
+// so a mode added to fmr_quant_supported fails to compile until every chain
+// handles it.
+template <QuantType QT, typename DTYPE_O>
+inline constexpr bool fmr_unhandled_quant = false;
+
+// Host dispatch tag for DTYPE_O: opus's narrow types are not all usable as
+// value tags.
+template <typename T>
+struct type_tag
+{
+    using type = T;
+};
 
 // Scales per thread in the phase-3 scatter, and the alignment the scale row
 // must satisfy: mx_scale_shuffle_idx's y terms are periodic in this, the
@@ -353,31 +379,38 @@ __device__ __forceinline__ void phase1_topk_select(const DTYPE_I* __restrict__ g
     }
 }
 
-// MXFP4 quant of one token's hidden row, by the whole block. A thread owns
-// TD contiguous columns at offset lane*TD within each pass, and PASSES passes
-// of BlockSize*TD columns cover the row. The e8m0 byte goes to a scratch row,
-// not the swizzled buffer: its swizzled position depends on the sorted row,
-// which is unknown until after the barrier.
+// Quant of one token's hidden row, by the whole block. A thread owns TD
+// contiguous columns at offset lane*TD within each pass, and PASSES passes of
+// ACTIVE*TD columns cover the row.
+//
+// MXFP4: scale_dst is the tok_scale scratch row, not the swizzled buffer: an
+// e8m0 byte's swizzled position depends on the sorted row, which is unknown
+// until after the barrier.
+//
+// FP8 per-token: scale_dst is the final [M, 1] fp32 scale, indexed by token.
+// The math is dynamic_per_token_scaled_quant_kernel's, expression for
+// expression (0.f start, block_reduce max, the same scaled_quant_vgpr_impl
+// instantiation on the bf16 vector), so bytes and scale match it exactly.
+// block_reduce synchronizes the block, so every thread must reach this call,
+// and the row's abs-max spans every pass before any of them is stored.
 //
 // PASSES == 1 && ACTIVE == BlockSize is the original single-pass form and must
 // stay codegen-identical: the loop folds away and `lane` is threadIdx.x.
 //
-// WRITE_OUT=false emits only the e8m0 bytes: the small-M path quants a token
-// once per block holding one of its rows, but only the owner writes out_fp4.
-// scale_token indexes tok_scale independently of the input row, so that path
-// can aim the bytes at a one-row LDS buffer instead of the global scratch.
-template <int BlockSize, int TD, typename DTYPE_I, int PASSES = 1, int ACTIVE = BlockSize,
-          bool WRITE_OUT = true>
-__device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out,
-                                                   uint8_t* __restrict__ tok_scale,
+// WRITE_OUT=false emits only the scales: the small-M path quants a token once
+// per block holding one of its rows, but only the owner writes out.
+// scale_token indexes scale_dst independently of the input row, so that path
+// can aim the MXFP4 bytes at a one-row LDS buffer instead of the global scratch.
+template <int BlockSize, int TD, typename DTYPE_I, QuantType QT, int PASSES = 1,
+          int ACTIVE = BlockSize, bool WRITE_OUT = true, typename DTYPE_O, typename DTYPE_S>
+__device__ __forceinline__ void phase1_quant_token(DTYPE_O* __restrict__ out,
+                                                   DTYPE_S* __restrict__ scale_dst,
                                                    const DTYPE_I* __restrict__ input,
                                                    int token, int cols, int group_size,
                                                    int scaleN_pad, int scale_token = -1)
 {
     if(scale_token < 0)
         scale_token = token;
-    const int num_thread_per_group = group_size / TD;
-    const int scaleN_valid         = (cols + group_size - 1) / group_size;
 
     using vec_i = opus::vector_t<DTYPE_I, TD>;
     using vec_f = opus::vector_t<float, TD>;
@@ -385,44 +418,92 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
     auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token * cols,
                                                  cols * sizeof(DTYPE_I));
 
-    // Threads past ACTIVE own no columns. Only variant C leaves any idle; the
-    // reduce below spans num_thread_per_group lanes, which stay within one
-    // group, so idle lanes cannot corrupt an active group's abs-max.
-    if constexpr(ACTIVE < BlockSize)
-        if(threadIdx.x >= ACTIVE)
-            return;
-
-#pragma unroll
-    for(int p = 0; p < PASSES; ++p)
+    if constexpr(QT == QuantType::per_Token && std::is_same_v<DTYPE_O, opus::fp8_t>)
     {
-        const int lane     = p * ACTIVE + (int)threadIdx.x;
-        const int scale_k  = lane / num_thread_per_group;
-
-        vec_i vin = load_vector_nbytes<DTYPE_I, TD,
-                                       (sizeof(DTYPE_I) * TD % 16 == 0 ? 16 : 8), /*aux=*/0>(
-            buffer_input, lane * TD);
-        vec_f  vin_f32;
-        float* vin_f32_ptr = reinterpret_cast<float*>(&vin_f32);
-        float  absMax      = 1e-10f;
+        const float inverted_DTYPE_MAX =
+            (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        // Threads past ACTIVE own no columns but still join the block_reduce,
+        // contributing the 0.f identity.
+        const bool active = ACTIVE == BlockSize || (int)threadIdx.x < ACTIVE;
+        vec_i      vin[PASSES];
+        float      absMax = 0.f;
 #pragma unroll
-        for(int j = 0; j < TD; ++j)
+        for(int p = 0; p < PASSES; ++p)
         {
-            vin_f32[j] = bf16f(vin[j]);
-            absMax     = max(absMax, fabsf(vin_f32[j]));
+            if(active)
+            {
+                vin[p] = load_vector_nbytes<DTYPE_I, TD,
+                                            (sizeof(DTYPE_I) * TD % 16 == 0 ? 16 : 8),
+                                            /*aux=*/0>(buffer_input,
+                                                       (p * ACTIVE + (int)threadIdx.x) * TD);
+#pragma unroll
+                for(int j = 0; j < TD; ++j)
+                    absMax = max(absMax, abs(static_cast<float>(vin[p][j])));
+            }
         }
-        absMax          = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
-        float row_scale = aiter::fp4_f32_to_e8m0_scale(absMax);
-
-        if(lane % num_thread_per_group == 0 && scale_k < scaleN_valid)
-            tok_scale[(int64_t)scale_token * scaleN_pad + scale_k] =
-                (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
-
+        absMax = block_reduce<float, aiter::Max, BlockSize, true>(absMax, aiter::Max());
+        float row_scale = absMax * inverted_DTYPE_MAX;
+        if(threadIdx.x == 0)
+            scale_dst[scale_token] = row_scale;
         // scaled_quant_vgpr_impl derives its store lane from threadIdx.x, so a
         // multi-pass call must shift the base pointer by the pass instead.
         if constexpr(WRITE_OUT)
-            scaled_quant_vgpr_impl<float, opus::fp4_t, TD>(
-                out, vin_f32_ptr, &row_scale, cols,
-                (int64_t)token * cols + (int64_t)p * ACTIVE * TD);
+            if(active)
+#pragma unroll
+                for(int p = 0; p < PASSES; ++p)
+                    scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, TD>(
+                        out, reinterpret_cast<DTYPE_I*>(&vin[p]), &row_scale, cols,
+                        (int64_t)token * cols + (int64_t)p * ACTIVE * TD);
+    }
+    else if constexpr(QT == QuantType::per_1x32 && std::is_same_v<DTYPE_O, opus::fp4_t>)
+    {
+        const int num_thread_per_group = group_size / TD;
+        const int scaleN_valid         = (cols + group_size - 1) / group_size;
+
+        // Threads past ACTIVE own no columns. Only variant C leaves any idle; the
+        // reduce below spans num_thread_per_group lanes, which stay within one
+        // group, so idle lanes cannot corrupt an active group's abs-max.
+        if constexpr(ACTIVE < BlockSize)
+            if(threadIdx.x >= ACTIVE)
+                return;
+
+#pragma unroll
+        for(int p = 0; p < PASSES; ++p)
+        {
+            const int lane     = p * ACTIVE + (int)threadIdx.x;
+            const int scale_k  = lane / num_thread_per_group;
+
+            vec_i vin = load_vector_nbytes<DTYPE_I, TD,
+                                           (sizeof(DTYPE_I) * TD % 16 == 0 ? 16 : 8),
+                                           /*aux=*/0>(buffer_input, lane * TD);
+            vec_f  vin_f32;
+            float* vin_f32_ptr = reinterpret_cast<float*>(&vin_f32);
+            float  absMax      = 1e-10f;
+#pragma unroll
+            for(int j = 0; j < TD; ++j)
+            {
+                vin_f32[j] = bf16f(vin[j]);
+                absMax     = max(absMax, fabsf(vin_f32[j]));
+            }
+            absMax          = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
+            float row_scale = aiter::fp4_f32_to_e8m0_scale(absMax);
+
+            if(lane % num_thread_per_group == 0 && scale_k < scaleN_valid)
+                scale_dst[(int64_t)scale_token * scaleN_pad + scale_k] =
+                    (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
+
+            // scaled_quant_vgpr_impl derives its store lane from threadIdx.x, so a
+            // multi-pass call must shift the base pointer by the pass instead.
+            if constexpr(WRITE_OUT)
+                scaled_quant_vgpr_impl<float, DTYPE_O, TD>(
+                    out, vin_f32_ptr, &row_scale, cols,
+                    (int64_t)token * cols + (int64_t)p * ACTIVE * TD);
+        }
+    }
+    else
+    {
+        static_assert(fmr_unhandled_quant<QT, DTYPE_O>,
+                      "phase1_quant_token: no quant path for this (QuantType, DTYPE_O)");
     }
 }
 
@@ -442,10 +523,10 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
             CALL(8);                \
     } while(0)
 
-template <int BlockSize, int TD, int NSHARED, typename DTYPE_I, typename DTYPE_B,
-          int QPASSES = 1, int QACTIVE = BlockSize>
+template <int BlockSize, int TD, int NSHARED, typename DTYPE_I, typename DTYPE_B, QuantType QT,
+          int QPASSES, int QACTIVE, typename DTYPE_O, typename DTYPE_S>
 __device__ __forceinline__ void
-phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
+phase1_token(DTYPE_O* __restrict__ out, DTYPE_S* __restrict__ scale_dst,
              const DTYPE_I* __restrict__ hidden, const DTYPE_I* __restrict__ gating,
              const DTYPE_B* __restrict__ bias, float* __restrict__ topk_weights,
              int* __restrict__ topk_ids, int token, int E, int topk, int cols, int group_size,
@@ -464,8 +545,8 @@ phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
 #undef FMR_LOAD
     }
 
-    phase1_quant_token<BlockSize, TD, DTYPE_I, QPASSES, QACTIVE>(
-        out, tok_scale, hidden, token, cols, group_size, scaleN_pad);
+    phase1_quant_token<BlockSize, TD, DTYPE_I, QT, QPASSES, QACTIVE>(
+        out, scale_dst, hidden, token, cols, group_size, scaleN_pad);
 
     if(sel)
     {
@@ -560,9 +641,13 @@ enum FmrPart { kFused = 0, kPhase1 = 1, kPhase23 = 2 };
 // QPASSES/QACTIVE parameterize phase 1's quant geometry only; every other phase
 // depends on cols solely through scaleN_valid. Defaults are the single-pass
 // full-block form, so existing instantiations are unchanged.
+//
+// (QT, DTYPE_O) is the activation quant mode, see fmr_quant_supported. The
+// defaults are MXFP4, so the pre-existing instantiations keep their codegen.
 template <int BlockSize, int TD, typename DTYPE_I, int PART = kFused,
           typename DTYPE_B = DTYPE_I, int NSHARED = 0,
-          int QPASSES = 1, int QACTIVE = BlockSize>
+          int QPASSES = 1, int QACTIVE = BlockSize, QuantType QT = QuantType::per_1x32,
+          typename DTYPE_O = opus::fp4_t>
 __global__ void __launch_bounds__(BlockSize)
 fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          const DTYPE_B* __restrict__ bias,     // [E] fp32 or bf16
@@ -573,9 +658,11 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          float* __restrict__ sorted_weights,   // [maxpad]
                          int* __restrict__ sorted_expert_ids,  // [maxblk]
                          int* __restrict__ num_valid_ids,      // [2]
-                         opus::fp4_t* __restrict__ out,        // [M, cols/2]
-                         uint8_t* __restrict__ out_scale,      // swizzled e8m0
-                         uint8_t* __restrict__ tok_scale,      // [M, scaleN_pad] scratch
+                         // MXFP4: [M, cols/2] fp4x2. FP8 per-token: [M, cols] fp8.
+                         DTYPE_O* __restrict__ out,
+                         // MXFP4: swizzled e8m0 (uint8_t). FP8 per-token: [M, 1] fp32.
+                         void* __restrict__ out_scale,
+                         uint8_t* __restrict__ tok_scale,      // [M, scaleN_pad] scratch, MXFP4 only
                          // Zeroed here rather than in a separate fill launch;
                          // never read here, so it needs no ordering.
                          DTYPE_I* __restrict__ moe_buf,        // [M, model_dim] or nullptr
@@ -591,6 +678,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          // rank's slot in the de-duplicating round-robin.
                          float shared_w, int ep_rank, int ep_size)
 {
+    static_assert(fmr_quant_supported<QT, DTYPE_O>, "unsupported fused router quant mode");
     extern __shared__ char smem_raw[];
     // One row per pick plus one per fused shared expert.
     const int  topk_total        = topk + NSHARED;
@@ -648,12 +736,26 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
             moe_buf[i] = (DTYPE_I)0;
     }
 
+    // Where phase 1 writes a token's scale: MXFP4 stages e8m0 bytes in the
+    // tok_scale scratch for the phase-3 scatter; FP8 per-token writes its fp32
+    // scale straight to the final [M, 1] output.
+    auto* scale_dst = [&] {
+        if constexpr(QT == QuantType::per_Token)
+            return static_cast<float*>(out_scale);
+        else if constexpr(QT == QuantType::per_1x32)
+            return tok_scale;
+        else
+            static_assert(fmr_unhandled_quant<QT, DTYPE_O>,
+                          "fused_moe_routing_kernel: no phase-1 scale destination for this "
+                          "QuantType");
+    }();
+
     // Phase 1: per-token topk + quant.
     if constexpr(PART != kPhase23)
     for(int t = blockIdx.x; t < M; t += gridDim.x)
     {
-        phase1_token<BlockSize, TD, NSHARED, DTYPE_I, DTYPE_B, QPASSES, QACTIVE>(
-            out, tok_scale, hidden, gating, bias, topk_weights, topk_ids, t, E, topk, cols,
+        phase1_token<BlockSize, TD, NSHARED, DTYPE_I, DTYPE_B, QT, QPASSES, QACTIVE>(
+            out, scale_dst, hidden, gating, bias, topk_weights, topk_ids, t, E, topk, cols,
             group_size, scaleN_pad, need_renorm, rsf, shared_w, ep_rank, ep_size);
         __syncthreads(); // the aliased scratch is reused each iteration
     }
@@ -880,10 +982,13 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
             }
         }
 
+        // Scale scatter: MX modes only.
+        if constexpr(QT == QuantType::per_1x32)
         {
             // thread_data e8m0 bytes per thread, so `chunk` threads cover one
             // sorted row -- the shape the stock mxfp4_moe_sort_kernel uses, and
             // the one that keeps the writes coalesced through the swizzle.
+            uint8_t* out_scale_mx     = static_cast<uint8_t*>(out_scale);
             constexpr int thread_data = kScalesPerThread;
             const int     chunk       = scaleN_valid / thread_data;
             for(int idx = tid; idx < (row_end - row_begin) * chunk; idx += BlockSize)
@@ -909,8 +1014,19 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                 constexpr int OFF[thread_data] = {0, 64, 128, 192, 2, 66, 130, 194};
 #pragma unroll
                 for(int j = 0; j < thread_data; ++j)
-                    out_scale[sbase + OFF[j]] = src ? src[j] : (uint8_t)0;
+                    out_scale_mx[sbase + OFF[j]] = src ? src[j] : (uint8_t)0;
             }
+        }
+        else if constexpr(QT == QuantType::per_Token)
+        {
+            // Nothing to scatter: phase 1 wrote the final token-indexed scale,
+            // and the per-token GEMMs gather it through sorted_ids.
+        }
+        else
+        {
+            static_assert(fmr_unhandled_quant<QT, DTYPE_O>,
+                          "fused_moe_routing_kernel: no phase-3 scale handling for this "
+                          "QuantType");
         }
         __syncthreads(); // s_buf is reused by the next expert in the slice
         row_begin = row_end;
@@ -933,8 +1049,12 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
 // critical path; the cost is topk-fold redundant hidden-row bandwidth, which is
 // what the host-side dispatch gate bounds. out_fp4 and topk_ids/topk_weights
 // are written by the lowest-expert-id owner, so the redundancy stays reads.
+//
+// FP8 per-token has no scatter: the uniform quant writes the token-indexed fp32
+// scale straight to out_scale, racing as benignly as the fp8 bytes do.
 template <int BlockSize, int TD, typename DTYPE_I, typename DTYPE_B = DTYPE_I,
-          int NSHARED = 0, int QPASSES = 1, int QACTIVE = BlockSize>
+          int NSHARED = 0, int QPASSES = 1, int QACTIVE = BlockSize,
+          QuantType QT = QuantType::per_1x32, typename DTYPE_O = opus::fp4_t>
 __global__ void __launch_bounds__(BlockSize)
 fused_moe_routing_small_kernel(const DTYPE_I* __restrict__ gating,
                                const DTYPE_B* __restrict__ bias,
@@ -945,14 +1065,15 @@ fused_moe_routing_small_kernel(const DTYPE_I* __restrict__ gating,
                                float* __restrict__ sorted_weights,
                                int* __restrict__ sorted_expert_ids,
                                int* __restrict__ num_valid_ids,
-                               opus::fp4_t* __restrict__ out,
-                               uint8_t* __restrict__ out_scale,
+                               DTYPE_O* __restrict__ out,
+                               void* __restrict__ out_scale,
                                DTYPE_I* __restrict__ moe_buf, int moe_buf_elems,
                                const int* __restrict__ expert_mask,
                                int M, int E, int topk, int unit_size, int group_size, int cols,
                                int max_blocks, int max_tokens, bool need_renorm, float rsf,
                                float shared_w, int ep_rank, int ep_size)
 {
+    static_assert(fmr_quant_supported<QT, DTYPE_O>, "unsupported fused router quant mode");
     extern __shared__ char smem_raw[];
     const int     topk_total        = topk + NSHARED;
     const int     total_routed_rows = M * topk_total;
@@ -1010,8 +1131,19 @@ fused_moe_routing_small_kernel(const DTYPE_I* __restrict__ gating,
     // scatters straight from it. A wider gate would need a row per token, or the
     // per-slice requant this replaced.
     for(int t = 0; t < M; ++t)
-        phase1_quant_token<BlockSize, TD, DTYPE_I, QPASSES, QACTIVE, true>(
-            out, s_scale, hidden, t, cols, group_size, kMaxScaleNPad, t);
+    {
+        if constexpr(QT == QuantType::per_Token)
+            phase1_quant_token<BlockSize, TD, DTYPE_I, QT, QPASSES, QACTIVE, true>(
+                out, static_cast<float*>(out_scale), hidden, t, cols, group_size,
+                kMaxScaleNPad, t);
+        else if constexpr(QT == QuantType::per_1x32)
+            phase1_quant_token<BlockSize, TD, DTYPE_I, QT, QPASSES, QACTIVE, true>(
+                out, s_scale, hidden, t, cols, group_size, kMaxScaleNPad, t);
+        else
+            static_assert(fmr_unhandled_quant<QT, DTYPE_O>,
+                          "fused_moe_routing_small_kernel: no quant destination for this "
+                          "QuantType");
+    }
 
     // Routing, replicated. One wave per token.
     for(int e = tid; e < E_tot; e += BlockSize)
@@ -1177,40 +1309,56 @@ fused_moe_routing_small_kernel(const DTYPE_I* __restrict__ gating,
             }
         }
 
-        constexpr int thread_data = kScalesPerThread;
-        const int     chunk       = scaleN_valid / thread_data;
-
-        // Real rows, one at a time: the quant is block-wide and so is the
-        // scatter that reads its scales, so the two cannot overlap and s_scale
-        // holds exactly one row. Sentinel rows carry no token and are zeroed in
-        // one flat pass below instead of spinning the quant once per padded row.
-        const int real_end = min(row_end, base + cnt);
-        for(int idx = tid; idx < (real_end - max(row_begin, base)) * chunk; idx += BlockSize)
+        // Scale scatter: MX modes only.
+        if constexpr(QT == QuantType::per_1x32)
         {
-            const int slice_row   = idx / chunk;
-            const int row         = max(row_begin, base) + slice_row;
-            const int scale_begin = (idx - slice_row * chunk) * thread_data;
-            const int token       = s_buf[row - base] / topk_total;
-            const int sbase = (row / 32 * scaleN_pad) * 32 + (scale_begin / 8) * 256 +
-                              (row % 16) * 4 + (row % 32) / 16;
-            constexpr int OFF[thread_data] = {0, 64, 128, 192, 2, 66, 130, 194};
-            const uint8_t* src = s_scale + (int64_t)token * kMaxScaleNPad + scale_begin;
+            uint8_t* out_scale_mx     = static_cast<uint8_t*>(out_scale);
+            constexpr int thread_data = kScalesPerThread;
+            const int     chunk       = scaleN_valid / thread_data;
+
+            // Real rows, one at a time: the quant is block-wide and so is the
+            // scatter that reads its scales, so the two cannot overlap and s_scale
+            // holds exactly one row. Sentinel rows carry no token and are zeroed in
+            // one flat pass below instead of spinning the quant once per padded row.
+            const int real_end = min(row_end, base + cnt);
+            for(int idx = tid; idx < (real_end - max(row_begin, base)) * chunk; idx += BlockSize)
+            {
+                const int slice_row   = idx / chunk;
+                const int row         = max(row_begin, base) + slice_row;
+                const int scale_begin = (idx - slice_row * chunk) * thread_data;
+                const int token       = s_buf[row - base] / topk_total;
+                const int sbase = (row / 32 * scaleN_pad) * 32 + (scale_begin / 8) * 256 +
+                                  (row % 16) * 4 + (row % 32) / 16;
+                constexpr int OFF[thread_data] = {0, 64, 128, 192, 2, 66, 130, 194};
+                const uint8_t* src = s_scale + (int64_t)token * kMaxScaleNPad + scale_begin;
 #pragma unroll
-            for(int j = 0; j < thread_data; ++j)
-                out_scale[sbase + OFF[j]] = src[j];
+                for(int j = 0; j < thread_data; ++j)
+                    out_scale_mx[sbase + OFF[j]] = src[j];
+            }
+
+            for(int idx = tid; idx < (row_end - real_end) * chunk; idx += BlockSize)
+            {
+                const int slice_row   = idx / chunk;
+                const int row         = real_end + slice_row;
+                const int scale_begin = (idx - slice_row * chunk) * thread_data;
+                const int sbase = (row / 32 * scaleN_pad) * 32 + (scale_begin / 8) * 256 +
+                                  (row % 16) * 4 + (row % 32) / 16;
+                constexpr int OFF[thread_data] = {0, 64, 128, 192, 2, 66, 130, 194};
+#pragma unroll
+                for(int j = 0; j < thread_data; ++j)
+                    out_scale_mx[sbase + OFF[j]] = (uint8_t)0;
+            }
         }
-
-        for(int idx = tid; idx < (row_end - real_end) * chunk; idx += BlockSize)
+        else if constexpr(QT == QuantType::per_Token)
         {
-            const int slice_row   = idx / chunk;
-            const int row         = real_end + slice_row;
-            const int scale_begin = (idx - slice_row * chunk) * thread_data;
-            const int sbase = (row / 32 * scaleN_pad) * 32 + (scale_begin / 8) * 256 +
-                              (row % 16) * 4 + (row % 32) / 16;
-            constexpr int OFF[thread_data] = {0, 64, 128, 192, 2, 66, 130, 194};
-#pragma unroll
-            for(int j = 0; j < thread_data; ++j)
-                out_scale[sbase + OFF[j]] = (uint8_t)0;
+            // Nothing to scatter: the up-front quant wrote the final
+            // token-indexed scale.
+        }
+        else
+        {
+            static_assert(fmr_unhandled_quant<QT, DTYPE_O>,
+                          "fused_moe_routing_small_kernel: no phase-3 scale handling for this "
+                          "QuantType");
         }
         __syncthreads();
         row_begin = row_end;
@@ -1333,7 +1481,7 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                            aiter_tensor_t& sorted_weights,
                            aiter_tensor_t& sorted_expert_ids,
                            aiter_tensor_t& num_valid_ids,
-                           aiter_tensor_t& out_fp4,
+                           aiter_tensor_t& out_q,
                            aiter_tensor_t& out_scale,
                            int64_t num_experts,
                            int64_t topk,
@@ -1347,7 +1495,8 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                            int64_t num_fused_shared_experts,
                            double shared_expert_weight,
                            int64_t ep_rank,
-                           int64_t ep_size)
+                           int64_t ep_size,
+                           int64_t quant_type)
 {
     // See fused_moe_router_workspace_size.
     aiter_detail::g_aiter_can_throw = true;
@@ -1398,20 +1547,56 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
     AITER_CHECK(E <= 2 * geom.block,
                 "fused_moe_router_impl: num_experts must be <= ", 2 * geom.block,
                 ", got ", E);
-    // A partial group would make the abs-max reduction span the wrong lanes.
-    AITER_CHECK(group_size % geom.td == 0,
-                "fused_moe_router_impl: group_size must be a multiple of ", geom.td,
-                ", got ", group_size);
-    // Phase 3's hoisted swizzle table is only complete on an aligned column
-    // span; a partial span leaves trailing scale columns holding stale
-    // allocator memory read back as e8m0 exponents. Implied by
-    // cols == passes * active * td, checked so the coupling cannot be lost
-    // silently.
-    AITER_CHECK((cols + group_size - 1) / group_size % kScalesPerThread == 0,
-                "fused_moe_router_impl: scales per row (ceil(cols/group_size)) must be a "
-                "multiple of ", kScalesPerThread, ", got ",
-                (cols + group_size - 1) / group_size, " for cols=", cols,
-                " group_size=", group_size);
+
+    // The quant mode is the (quant_type, out_q dtype) pair: per_1x32 alone
+    // would be ambiguous once MXFP8 exists.
+    const QuantType qt = static_cast<QuantType>(quant_type);
+    // The kernel divides by group_size in both modes, even where FP8 ignores it.
+    AITER_CHECK(group_size > 0,
+                "fused_moe_router_impl: group_size must be positive, got ", group_size);
+    if(qt == QuantType::per_Token)
+    {
+        // opus::fp8_t is OCP e4m3 on gfx950, the only arch the router supports.
+        AITER_CHECK(out_q.dtype() == AITER_DTYPE_fp8,
+                    "fused_moe_router_impl: quant_type per_Token needs an fp8 out_q, got ",
+                    AiterDtype_to_str(out_q.dtype()));
+        AITER_CHECK(out_scale.dtype() == AITER_DTYPE_fp32,
+                    "fused_moe_router_impl: quant_type per_Token needs an fp32 out_scale, got ",
+                    AiterDtype_to_str(out_scale.dtype()));
+        AITER_CHECK((int64_t)out_q.numel() >= (int64_t)M * cols,
+                    "fused_moe_router_impl: out_q has ", out_q.numel(),
+                    " elements, need M * cols = ", (int64_t)M * cols);
+        AITER_CHECK((int64_t)out_scale.numel() >= M,
+                    "fused_moe_router_impl: out_scale has ", out_scale.numel(),
+                    " elements, need one per token (", M, ")");
+    }
+    else if(qt == QuantType::per_1x32)
+    {
+        AITER_CHECK(out_q.dtype() == AITER_DTYPE_fp4x2 || out_q.dtype() == AITER_DTYPE_u8,
+                    "fused_moe_router_impl: quant_type per_1x32 needs an fp4x2 out_q, got ",
+                    AiterDtype_to_str(out_q.dtype()));
+        // A partial group would make the abs-max reduction span the wrong lanes.
+        AITER_CHECK(group_size % geom.td == 0,
+                    "fused_moe_router_impl: group_size must be a multiple of ", geom.td,
+                    ", got ", group_size);
+        // Phase 3's hoisted swizzle table is only complete on an aligned column
+        // span; a partial span leaves trailing scale columns holding stale
+        // allocator memory read back as e8m0 exponents. Implied by
+        // cols == passes * active * td, checked so the coupling cannot be lost
+        // silently.
+        AITER_CHECK((cols + group_size - 1) / group_size % kScalesPerThread == 0,
+                    "fused_moe_router_impl: scales per row (ceil(cols/group_size)) must be a "
+                    "multiple of ", kScalesPerThread, ", got ",
+                    (cols + group_size - 1) / group_size, " for cols=", cols,
+                    " group_size=", group_size);
+    }
+    else
+    {
+        AITER_CHECK(false,
+                    "fused_moe_router_impl: quant_type must be per_1x32 (",
+                    static_cast<int64_t>(QuantType::per_1x32), ", MXFP4) or per_Token (",
+                    static_cast<int64_t>(QuantType::per_Token), ", FP8), got ", quant_type);
+    }
     AITER_CHECK(unit_size > 0 && (unit_size & (unit_size - 1)) == 0,
                 "fused_moe_router_impl: unit_size must be a power of two, got ", unit_size);
     const int topk_total = (int)topk + n_shared;
@@ -1526,7 +1711,7 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
     // reads the wrong elements rather than failing.
     for(const auto& p : {std::make_pair(&gating, "gating"),
                          std::make_pair(&hidden, "hidden"),
-                         std::make_pair(&out_fp4, "out_fp4"),
+                         std::make_pair(&out_q, "out_q"),
                          std::make_pair(&out_scale, "out_scale"),
                          std::make_pair(&bias, "bias"),
                          std::make_pair(&topk_ids, "topk_ids"),
@@ -1555,8 +1740,7 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
     auto* s_w    = typed_ptr<float>(sorted_weights, AITER_DTYPE_fp32, "sorted_weights");
     auto* s_eids = typed_ptr<int>(sorted_expert_ids, AITER_DTYPE_i32, "sorted_expert_ids");
     auto* n_vids = typed_ptr<int>(num_valid_ids, AITER_DTYPE_i32, "num_valid_ids");
-    auto* o_fp4  = reinterpret_cast<opus::fp4_t*>(out_fp4.data_ptr());
-    auto* o_scl  = reinterpret_cast<uint8_t*>(out_scale.data_ptr());
+    void* o_scl  = out_scale.data_ptr();
 
     // Unlike the stock biased_grouped_topk wrapper this path does not coerce
     // the bias; it dispatches on the real dtype instead, which is cheap since
@@ -1566,8 +1750,10 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                 "bfloat16, got ", AiterDtype_to_str(bias.dtype()));
     const bool bias_is_f32 = bias.dtype() == AITER_DTYPE_fp32;
 
-    // One body, instantiated per (bias dtype, shared-expert count, geometry).
-    auto launch_all = [&](auto bias_tag, auto nshared_tag, auto geom_tag) {
+    // One body, instantiated per (bias dtype, shared-expert count, geometry,
+    // quant mode).
+    auto launch_all = [&](auto bias_tag, auto nshared_tag, auto geom_tag, auto qt_tag,
+                          auto out_tag) {
         using DB                = decltype(bias_tag);
         constexpr int NSHARED   = decltype(nshared_tag)::value;
         using G                 = decltype(geom_tag);
@@ -1575,25 +1761,28 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
         constexpr int TD        = G::td;
         constexpr int QPASSES   = G::passes;
         constexpr int QACTIVE   = G::active;
-        const DB* b = reinterpret_cast<const DB*>(bias.data_ptr());
+        constexpr QuantType QTV = decltype(qt_tag)::value;
+        using DO                = typename decltype(out_tag)::type;
+        const DB* b    = reinterpret_cast<const DB*>(bias.data_ptr());
+        auto*     o_q  = reinterpret_cast<DO*>(out_q.data_ptr());
         if(use_small)
         {
             auto* ks = fused_moe_routing_small_kernel<
-                BlockSize, TD, opus::bf16_t, DB, NSHARED, QPASSES, QACTIVE>;
+                BlockSize, TD, opus::bf16_t, DB, NSHARED, QPASSES, QACTIVE, QTV, DO>;
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(ks),
                                       hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
             // No grid barrier here, so co-residency is not required and the
             // grid is exactly phase 3's unit-width bound -- not max(M, 16) as
             // everywhere else, since nothing has to cover a token per block.
             ks<<<units_bound, BlockSize, shmem, stream>>>(
-                g, b, h, w_out, id_out, s_ids, s_w, s_eids, n_vids, o_fp4, o_scl,
+                g, b, h, w_out, id_out, s_ids, s_w, s_eids, n_vids, o_q, o_scl,
                 moe_buf_ptr, moe_buf_elems, mask_ptr, M, E, topk, unit_size, group_size,
                 cols, max_blocks, max_tokens, need_renorm, (float)routed_scaling_factor,
                 (float)shared_expert_weight, (int)ep_rank, (int)ep_size);
             return;
         }
         auto* kern  = fused_moe_routing_kernel<
-            BlockSize, TD, opus::bf16_t, kFused, DB, NSHARED, QPASSES, QACTIVE>;
+            BlockSize, TD, opus::bf16_t, kFused, DB, NSHARED, QPASSES, QACTIVE, QTV, DO>;
         (void)hipFuncSetAttribute(reinterpret_cast<const void*>(kern),
                                   hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
         // The grid barrier deadlocks unless every block is co-resident.
@@ -1606,7 +1795,7 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
         // boundary needs no co-residency, so each half gets a grid sized to its
         // own parallelism.
 #define FMR_ARGS                                                                      \
-    g, b, h, w_out, id_out, s_ids, s_w, s_eids, n_vids, o_fp4, o_scl, ws_tok_scale,   \
+    g, b, h, w_out, id_out, s_ids, s_w, s_eids, n_vids, o_q, o_scl, ws_tok_scale,     \
         moe_buf_ptr, moe_buf_elems, ws_sem, mask_ptr, M, E, topk, unit_size,          \
         group_size, cols, max_blocks, max_tokens, need_renorm,                        \
         (float)routed_scaling_factor, (float)shared_expert_weight, (int)ep_rank,      \
@@ -1614,9 +1803,9 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
         if(M >= split_min)
         {
             auto* k1  = fused_moe_routing_kernel<
-                BlockSize, TD, opus::bf16_t, kPhase1, DB, NSHARED, QPASSES, QACTIVE>;
+                BlockSize, TD, opus::bf16_t, kPhase1, DB, NSHARED, QPASSES, QACTIVE, QTV, DO>;
             auto* k23 = fused_moe_routing_kernel<
-                BlockSize, TD, opus::bf16_t, kPhase23, DB, NSHARED, QPASSES, QACTIVE>;
+                BlockSize, TD, opus::bf16_t, kPhase23, DB, NSHARED, QPASSES, QACTIVE, QTV, DO>;
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k1),
                                       hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k23),
@@ -1636,32 +1825,51 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
     // The reference geometry must reach the same instantiation as before the
     // variants existed: its QPASSES/QACTIVE defaults make the pass loop and the
     // lane guard fold out, so cols == 4096 keeps its exact codegen.
-    auto dispatch_geom = [&](auto bias_tag, auto nshared_tag) {
+    auto dispatch_geom = [&](auto bias_tag, auto nshared_tag, auto qt_tag, auto out_tag) {
+#define FMR_GEOM(...) launch_all(bias_tag, nshared_tag, FmrGeomT<__VA_ARGS__>{}, qt_tag, out_tag)
         switch(geom.tag)
         {
-        case 'R': launch_all(bias_tag, nshared_tag, FmrGeomT<256, 16, 1, 256>{}); break;
-        case 'A': launch_all(bias_tag, nshared_tag, FmrGeomT<256, 8, 1, 256>{}); break;
-        case 'B': launch_all(bias_tag, nshared_tag, FmrGeomT<128, 16, 1, 128>{}); break;
-        case 'C': launch_all(bias_tag, nshared_tag, FmrGeomT<256, 16, 1, 128>{}); break;
-        case 'D': launch_all(bias_tag, nshared_tag, FmrGeomT<256, 8, 2, 128>{}); break;
+        case 'R': FMR_GEOM(256, 16, 1, 256); break;
+        case 'A': FMR_GEOM(256, 8, 1, 256); break;
+        case 'B': FMR_GEOM(128, 16, 1, 128); break;
+        case 'C': FMR_GEOM(256, 16, 1, 128); break;
+        case 'D': FMR_GEOM(256, 8, 2, 128); break;
         default: AITER_CHECK(false, "fused_moe_router_impl: bad geometry tag");
         }
+#undef FMR_GEOM
     };
 
     // NSHARED == 0 must reach the same instantiation as before this feature
     // existed, so the shared-expert lanes fold out entirely and the no-shared
     // config keeps its register count.
-    auto dispatch_shared = [&](auto bias_tag) {
+    auto dispatch_shared = [&](auto bias_tag, auto qt_tag, auto out_tag) {
         if(n_shared == 0)
-            dispatch_geom(bias_tag, std::integral_constant<int, 0>{});
+            dispatch_geom(bias_tag, std::integral_constant<int, 0>{}, qt_tag, out_tag);
         else
-            dispatch_geom(bias_tag, std::integral_constant<int, 1>{});
+            dispatch_geom(bias_tag, std::integral_constant<int, 1>{}, qt_tag, out_tag);
+    };
+
+    // MXFP4 passes its (QuantType, out type) explicitly, which names the same
+    // instantiation as the kernels' defaults. FP8 is instantiated over the same
+    // shared-expert and geometry ladder, so fused shared experts and every
+    // hidden dim work in both modes.
+    auto dispatch_quant = [&](auto bias_tag) {
+        if(qt == QuantType::per_Token)
+            dispatch_shared(bias_tag,
+                            std::integral_constant<QuantType, QuantType::per_Token>{},
+                            type_tag<opus::fp8_t>{});
+        else if(qt == QuantType::per_1x32)
+            dispatch_shared(bias_tag,
+                            std::integral_constant<QuantType, QuantType::per_1x32>{},
+                            type_tag<opus::fp4_t>{});
+        else
+            AITER_CHECK(false, "fused_moe_router_impl: no kernel for quant_type ", quant_type);
     };
 
     if(bias_is_f32)
-        dispatch_shared(float{});
+        dispatch_quant(float{});
     else
-        dispatch_shared(opus::bf16_t{});
+        dispatch_quant(opus::bf16_t{});
 }
 
 } // namespace aiter

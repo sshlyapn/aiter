@@ -1,6 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_enum.h"
 #include "aiter_tensor.h"
 #include <optional>
 
@@ -19,7 +20,13 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                            aiter_tensor_t& sorted_weights,
                            aiter_tensor_t& sorted_expert_ids,
                            aiter_tensor_t& num_valid_ids,
-                           aiter_tensor_t& out_fp4,
+                           // Quantized activations and their scales; layout
+                           // depends on quant_type:
+                           //   per_1x32 (MXFP4): out_q [M, cols/2] fp4x2,
+                           //                     out_scale swizzled e8m0
+                           //   per_Token (FP8):  out_q [M, cols] fp8 e4m3,
+                           //                     out_scale [M, 1] fp32
+                           aiter_tensor_t& out_q,
                            aiter_tensor_t& out_scale,
                            int64_t num_experts,
                            int64_t topk,
@@ -51,6 +58,9 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                            int64_t num_fused_shared_experts = 0,
                            double shared_expert_weight      = 1.0,
                            int64_t ep_rank                  = 0,
-                           int64_t ep_size                  = 1);
+                           int64_t ep_size                  = 1,
+                           // QuantType of the activation quant; with out_q's
+                           // dtype it picks the mode.
+                           int64_t quant_type = static_cast<int64_t>(QuantType::per_1x32));
 
 } // namespace aiter

@@ -4,14 +4,16 @@
 
 ``fused_moe_router_impl`` replaces the 4-kernel decode preamble in one launch:
 
-    biased_grouped_topk -> moe_sorting -> fused_dynamic_mx_quant_moe_sort
+    biased_grouped_topk -> moe_sorting -> fused_dynamic_mx_quant_moe_sort  (MXFP4)
+    biased_grouped_topk -> moe_sorting -> per_token_quant_hip              (FP8)
 
 The reference is that stock sequence, not a hand-written torch model, so a
 mismatch means the fusion diverged from the path it is meant to replace.
 
 topk ids and sorted rows are compared as multisets: any permutation of a given
 expert's rows is a valid sort, and the fused kernel's ballot rank need not
-match moe_sorting's atomic cursor. fp4 bytes and e8m0 scales must be exact.
+match moe_sorting's atomic cursor. fp4 bytes and e8m0 scales must be exact, as
+must fp8 bytes and the per-token fp32 scales.
 
 This test can be run two ways:
 
@@ -23,6 +25,8 @@ This test can be run two ways:
 """
 
 import argparse
+import dataclasses
+import functools
 import itertools
 import os
 import sys
@@ -32,7 +36,7 @@ import pytest
 import torch
 
 import aiter
-from aiter import dtypes
+from aiter import QuantType, dtypes, get_hip_quant
 from aiter.fused_moe import moe_sorting
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.fused_moe_router import (
@@ -46,10 +50,15 @@ from aiter.utility.dtypes import str2tuple
 
 torch.set_default_device("cuda")
 
-# The kernel is MXFP4 + gfx950 only; cols is fixed by the BlockSize*TD tiling
-# the entry asserts (the cols == BlockSize * TD check in the entry).
-COLS = 4096
+# The kernel is gfx950 only; cols must land on a phase-1 quant geometry the
+# entry covers (fmr_pick_geom in csrc/kernels/fused_moe_router.cu).
+HIDDEN_DIMS = (2048, 4096)
 GROUP_SIZE = 32
+# Activation quant modes, i.e. the kernel's (quant_type, out_q dtype) pairs.
+MXFP4, FP8 = "mxfp4", "fp8"
+MODES = (MXFP4, FP8)
+# Every output buffer of one call, in the order the entry takes them.
+KEYS = ("ti", "tw", "sids", "sw", "seids", "nv", "a1", "a1s")
 # Workspace sizing hint. Larger -m still works, it just allocates a
 # second, bigger buffer.
 WORKSPACE_MAX_TOKENS = 128
@@ -62,6 +71,15 @@ W_TOL = 2e-6
 
 def _skip_msg():
     return f"fused_moe_router requires gfx950, got {get_gfx()}"
+
+
+def _quant_type(mode):
+    if mode == FP8:
+        return QuantType.per_Token.value
+    elif mode == MXFP4:
+        return QuantType.per_1x32.value
+    else:
+        raise ValueError(f"unknown quant mode {mode!r}")
 
 
 def _expert_slots(E, n_shared, ep):
@@ -104,9 +122,8 @@ def _append_shared(ti, tw, M, E, n_shared, shared_w, ep_rank, ep_size):
     return torch.cat([ti, ids], dim=1), torch.cat([tw, w], dim=1)
 
 
-def _deswizzle(osc, nrows):
+def _deswizzle(osc, nrows, scale_n):
     """Invert mx_scale_shuffle_idx so scale rows can be compared by token."""
-    scale_n = COLS // GROUP_SIZE
     scalen_pad = ((scale_n + 7) // 8) * 8
     x = torch.arange(nrows).view(-1, 1)
     y = torch.arange(scale_n).view(1, -1)
@@ -121,10 +138,10 @@ def _deswizzle(osc, nrows):
     return osc.reshape(-1).view(torch.uint8)[idx.view(-1)].view(nrows, -1)
 
 
-def _inputs(M, E, bias_dtype, seed):
+def _inputs(M, E, bias_dtype, seed, cols=4096):
     torch.manual_seed(seed)
     g = torch.randn(M, E, dtype=dtypes.bf16)
-    h = torch.randn(M, COLS, dtype=dtypes.bf16)
+    h = torch.randn(M, cols, dtype=dtypes.bf16)
     # Draw the bias in bf16 and widen, so an fp32 bias holds bf16-representable
     # values. The stock wrapper only takes it in the gating dtype, so anything
     # needing the extra mantissa would make the two paths disagree on ties for
@@ -149,6 +166,7 @@ def _run_stock(
     shared_w=1.0,
     ep_rank=0,
     ep_size=1,
+    mode=MXFP4,
 ):
     tw = torch.empty(M, topk, dtype=dtypes.fp32)
     ti = torch.empty(M, topk, dtype=torch.int32)
@@ -171,18 +189,23 @@ def _run_stock(
     topk_total = topk + n_shared
     E_tot = _expert_slots(E, n_shared, mask is not None)
     sids, sw, seids, nv, moe_buf = moe_sorting(
-        ti, tw, E_tot, COLS, dtypes.bf16, block_size=unit_size, expert_mask=mask
+        ti, tw, E_tot, h.shape[1], dtypes.bf16, block_size=unit_size, expert_mask=mask
     )
-    o4, osc = fused_dynamic_mx_quant_moe_sort(
-        h,
-        sids,
-        nv,
-        token_num=M,
-        topk=topk_total,
-        block_size=unit_size,
-        quant_dtype=dtypes.fp4x2,
-        sorted_weights=sw,
-    )
+    if mode == FP8:
+        a1, a1s = get_hip_quant(QuantType.per_Token)(h, quant_dtype=dtypes.fp8)
+    elif mode == MXFP4:
+        a1, a1s = fused_dynamic_mx_quant_moe_sort(
+            h,
+            sids,
+            nv,
+            token_num=M,
+            topk=topk_total,
+            block_size=unit_size,
+            quant_dtype=dtypes.fp4x2,
+            sorted_weights=sw,
+        )
+    else:
+        raise ValueError(f"unknown quant mode {mode!r}")
     return {
         "ti": ti,
         "tw": tw,
@@ -190,14 +213,23 @@ def _run_stock(
         "sw": sw,
         "seids": seids,
         "nv": nv,
-        "o4": o4,
-        "osc": osc,
+        "a1": a1,
+        "a1s": a1s,
         "moe_buf": moe_buf,
     }
 
 
-def _alloc(ref, M, topk):
+def _alloc(ref, M, topk, mode=MXFP4):
     """Output buffers, poisoned so an unwritten slot cannot pass by luck."""
+    if mode == FP8:
+        # 0x7f7f7f7f is a scale no bf16 row can produce (above bf16 max / 448).
+        a1 = _fill_pat(torch.empty_like(ref["a1"]), 0)
+        a1s = _fill_pat(torch.empty_like(ref["a1s"]), 0)
+    elif mode == MXFP4:
+        a1 = torch.zeros(ref["a1"].shape, dtype=torch.uint8).view(ref["a1"].dtype)
+        a1s = torch.zeros_like(ref["a1s"])
+    else:
+        raise ValueError(f"unknown quant mode {mode!r}")
     return {
         "ti": torch.full((M, topk), -1, dtype=torch.int32),
         "tw": torch.zeros(M, topk, dtype=dtypes.fp32),
@@ -205,8 +237,8 @@ def _alloc(ref, M, topk):
         "sw": torch.zeros_like(ref["sw"]),
         "seids": torch.full_like(ref["seids"], -1),
         "nv": torch.zeros_like(ref["nv"]),
-        "o4": torch.zeros(ref["o4"].shape, dtype=torch.uint8).view(ref["o4"].dtype),
-        "osc": torch.zeros_like(ref["osc"]),
+        "a1": a1,
+        "a1s": a1s,
     }
 
 
@@ -226,6 +258,7 @@ def _call_fused(
     shared_w=1.0,
     ep_rank=0,
     ep_size=1,
+    mode=MXFP4,
 ):
     fused_moe_router_impl(
         g,
@@ -237,8 +270,8 @@ def _call_fused(
         a["sw"],
         a["seids"],
         a["nv"],
-        a["o4"],
-        a["osc"],
+        a["a1"],
+        a["a1s"],
         E,
         topk,
         unit_size,
@@ -252,10 +285,54 @@ def _call_fused(
         shared_expert_weight=shared_w,
         ep_rank=ep_rank,
         ep_size=ep_size,
+        quant_type=_quant_type(mode),
     )
 
 
-def _compare(ref, got, M, topk, unit_size):
+def _quant_errs(ref, got, M, mode):
+    if mode == FP8:
+        # Token-indexed and written for every token whatever it routes to, so
+        # every row is defined, under EP too.
+        r8, g8 = ref["a1"].view(torch.uint8), got["a1"].view(torch.uint8)
+        rs, gs = ref["a1s"].view(torch.int32), got["a1s"].view(torch.int32)
+        return {
+            "fp8_err": int((r8 != g8).sum().item()),
+            "scale_err": int((rs != gs).sum().item()),
+        }
+    elif mode == MXFP4:
+        nv_r = int(ref["nv"][0])
+        if nv_r != int(got["nv"][0]):
+            return {"fp4_err": -1, "scale_err": -1}
+        if nv_r == 0:
+            return {"fp4_err": 0, "scale_err": 0}
+        # Only rows the sort references are defined: under EP most tokens route
+        # to no local expert and neither path writes their out_fp4 row.
+        r4 = ref["a1"].view(torch.uint8).view(M, -1)
+        g4 = got["a1"].view(torch.uint8).view(M, -1)
+        live = torch.zeros(M, dtype=torch.bool)
+        tok = ref["sids"][:nv_r] & 0xFFFFFF
+        live[tok[tok < M].long()] = True
+        errs = {"fp4_err": int((r4[live] != g4[live]).sum().item())}
+
+        # The swizzled scale buffer is only defined below num_valid, and which
+        # token owns a row is permutation-dependent. Deswizzle both, then
+        # compare each side's row against the scale its own sorted_ids says it
+        # should carry.
+        scale_n = r4.shape[1] * 2 // GROUP_SIZE
+        sr = _deswizzle(ref["a1s"], nv_r, scale_n)
+        sg = _deswizzle(got["a1s"], nv_r, scale_n)
+        tok_r = (ref["sids"][:nv_r] & 0xFFFFFF).clamp(max=M)
+        tok_g = (got["sids"][:nv_r] & 0xFFFFFF).clamp(max=M)
+        want = torch.zeros(M + 1, scale_n, dtype=torch.uint8)
+        real = tok_r < M
+        want[tok_r[real].long()] = sr[real]
+        errs["scale_err"] = int((sg != want[tok_g.long()]).sum().item())
+        return errs
+    else:
+        raise ValueError(f"unknown quant mode {mode!r}")
+
+
+def _compare(ref, got, M, topk, unit_size, mode=MXFP4):
     """Return {metric: error count or magnitude}; all zero means pass."""
     errs = {}
 
@@ -282,18 +359,17 @@ def _compare(ref, got, M, topk, unit_size):
     errs["num_valid_err"] = int(nv_r != nv_g) + int(
         int(ref["nv"][1]) != int(got["nv"][1])
     )
+    errs.update(_quant_errs(ref, got, M, mode))
     if nv_r != nv_g:
         # Everything downstream is indexed by num_valid; comparing past a
         # disagreement reports noise, so stop here.
-        errs.update(sorted_id_err=-1, sorted_w_err=-1, fp4_err=-1, scale_err=-1)
+        errs.update(sorted_id_err=-1, sorted_w_err=-1)
         return errs
 
     if nv_r == 0:
         # Under EP a rank can own no expert any token routed to. Nothing is
         # written, and both sides agreeing on that is the whole check.
-        errs.update(
-            expert_id_err=0, sorted_id_err=0, sorted_w_err=0.0, fp4_err=0, scale_err=0
-        )
+        errs.update(expert_id_err=0, sorted_id_err=0, sorted_w_err=0.0)
         return errs
 
     nblk = nv_r // unit_size
@@ -313,27 +389,6 @@ def _compare(ref, got, M, topk, unit_size):
             dw = max(dw, max((abs(x[1] - y[1]) for x, y in zip(a, c)), default=0.0))
     errs["sorted_id_err"] = bad_id
     errs["sorted_w_err"] = dw
-
-    # Only rows the sort references are defined: under EP most tokens route to
-    # no local expert and neither path writes their out_fp4 row.
-    r4 = ref["o4"].view(torch.uint8).view(M, -1)
-    g4 = got["o4"].view(torch.uint8).view(M, -1)
-    live = torch.zeros(M, dtype=torch.bool)
-    tok = ref["sids"][:nv_r] & 0xFFFFFF
-    live[tok[tok < M].long()] = True
-    errs["fp4_err"] = int((r4[live] != g4[live]).sum().item())
-
-    # The swizzled scale buffer is only defined below num_valid, and which token
-    # owns a row is permutation-dependent. Deswizzle both, then compare each
-    # side's row against the scale its own sorted_ids says it should carry.
-    sr = _deswizzle(ref["osc"], nv_r)
-    sg = _deswizzle(got["osc"], nv_r)
-    tok_r = (ref["sids"][:nv_r] & 0xFFFFFF).clamp(max=M)
-    tok_g = (got["sids"][:nv_r] & 0xFFFFFF).clamp(max=M)
-    want = torch.zeros(M + 1, COLS // GROUP_SIZE, dtype=torch.uint8)
-    real = tok_r < M
-    want[tok_r[real].long()] = sr[real]
-    errs["scale_err"] = int((sg != want[tok_g.long()]).sum().item())
     return errs
 
 
@@ -350,6 +405,8 @@ def _run_case(
     seed=None,
     n_shared=0,
     shared_w=1.0,
+    mode=MXFP4,
+    cols=4096,
 ):
     """One config, correctness only. Returns the error dict."""
     mask = None
@@ -357,16 +414,17 @@ def _run_case(
     if ep is not None:
         ep_rank, ep_size = ep[0], ep[1]
         mask = _make_mask(E, ep_rank, ep_size, vllm_shape=ep[2], n_shared=n_shared)
-    g, b, h = _inputs(M, E, bias_dtype, M if seed is None else seed)
+    g, b, h = _inputs(M, E, bias_dtype, M if seed is None else seed, cols)
     shared = {
         "n_shared": n_shared,
         "shared_w": shared_w,
         "ep_rank": ep_rank,
         "ep_size": ep_size,
+        "mode": mode,
     }
     ref = _run_stock(g, b, h, M, E, topk, unit_size, need_renorm, rsf, mask, **shared)
     topk_total = topk + n_shared
-    got = _alloc(ref, M, topk_total)
+    got = _alloc(ref, M, topk_total, mode)
     moe_buf = None
     if use_moe_buf:
         # Poisoned: the kernel is supposed to zero it while routing runs.
@@ -386,7 +444,7 @@ def _run_case(
         **shared,
     )
     torch.cuda.synchronize()
-    errs = _compare(ref, got, M, topk_total, unit_size)
+    errs = _compare(ref, got, M, topk_total, unit_size, mode)
     errs["moe_buf_err"] = int((moe_buf != 0).sum().item()) if use_moe_buf else 0
     return errs, (g, b, h, ref, got, mask)
 
@@ -420,10 +478,10 @@ def _fill_pat(t, tag):
     return t
 
 
-def _alloc_poisoned(ref, M, topk, tag=0):
+def _alloc_poisoned(ref, M, topk, tag=0, mode=MXFP4):
     """Output buffers filled with allocator-garbage rather than clean values."""
-    a = _alloc(ref, M, topk)
-    for k in ("ti", "tw", "sids", "sw", "seids", "nv", "o4", "osc"):
+    a = _alloc(ref, M, topk, mode)
+    for k in KEYS:
         _fill_pat(a[k], tag)
     # num_valid is read as a count; garbage is not a meaningful start state and
     # the kernel unconditionally overwrites it.
@@ -531,7 +589,7 @@ def bench_fused_moe_router(
 
 
 @benchmark()
-def bench_barrier_stress(M_list, E, topk, unit_size, iters):
+def bench_barrier_stress(M_list, E, topk, unit_size, iters, mode=MXFP4):
     """Hammer the self-resetting grid barrier.
 
     The semaphore is a process-wide static that is zeroed once and then relies
@@ -555,7 +613,7 @@ def bench_barrier_stress(M_list, E, topk, unit_size, iters):
                 g,
                 b,
                 h,
-                _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None),
+                _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None, mode=mode),
             )
         torch.cuda.synchronize()
 
@@ -565,14 +623,16 @@ def bench_barrier_stress(M_list, E, topk, unit_size, iters):
         for i in range(iters):
             M = M_list[i % len(M_list)]
             g, b, h, ref = refs[M]
-            got = _alloc(ref, M, topk)
-            _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, None, None)
+            got = _alloc(ref, M, topk, mode)
+            _call_fused(
+                g, b, h, got, E, topk, unit_size, True, 1.0, None, None, mode=mode
+            )
             outs.append((M, ref, got))
         torch.cuda.synchronize()
 
         bad = 0
         for M, ref, got in outs:
-            if _failed(_compare(ref, got, M, topk, unit_size)):
+            if _failed(_compare(ref, got, M, topk, unit_size, mode)):
                 bad += 1
         return {"launches": len(outs), "stress_err": bad}
     finally:
@@ -591,40 +651,66 @@ def _expect_raises(fn, what):
     return 1
 
 
-def check_rejects_bad_shapes(E=320, topk=8, unit_size=16):
+def check_rejects_bad_shapes(E=320, topk=8, unit_size=16, mode=MXFP4):
     """The entry must reject what it cannot serve instead of mis-routing."""
     if not SUPPORTED:
         return 0
     M = 16
     g, b, h = _inputs(M, E, dtypes.bf16, 0)
-    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None)
-    got = _alloc(ref, M, topk)
+    cols = h.shape[1]
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None, mode=mode)
+    got = _alloc(ref, M, topk, mode)
     bad = 0
 
-    # Not COLS // 2: that is a supported hidden dim. This width lands on no
-    # geometry, so the entry must decline rather than quantize a partial row.
-    h_narrow = torch.randn(M, COLS // 4 * 3, dtype=dtypes.bf16)
-    bad += _expect_raises(
-        lambda: _call_fused(
-            g, b, h_narrow, got, E, topk, unit_size, True, 1.0, None, None
-        ),
-        f"cols={COLS // 4 * 3}",
-    )
+    # Widths no TD covers; the output buffers are sized for cols, so only the
+    # width check can fire.
+    for bad_cols in (1024, 3072, 8192):
+        h_bad = torch.randn(M, bad_cols, dtype=dtypes.bf16)
+        bad += _expect_raises(
+            lambda h_bad=h_bad: _call_fused(
+                g, b, h_bad, got, E, topk, unit_size, True, 1.0, None, None, mode=mode
+            ),
+            f"cols={bad_cols}",
+        )
     g_wide = torch.randn(M, 1024, dtype=dtypes.bf16)
     b_wide = torch.randn(1024, dtype=dtypes.bf16)
     bad += _expect_raises(
         lambda: _call_fused(
-            g_wide, b_wide, h, got, 1024, topk, unit_size, True, 1.0, None, None
+            g_wide,
+            b_wide,
+            h,
+            got,
+            1024,
+            topk,
+            unit_size,
+            True,
+            1.0,
+            None,
+            None,
+            mode=mode,
         ),
         "num_experts=1024",
     )
     bad += _expect_raises(
-        lambda: _call_fused(g, b, h, got, E, topk, 24, True, 1.0, None, None),
+        lambda: _call_fused(
+            g, b, h, got, E, topk, 24, True, 1.0, None, None, mode=mode
+        ),
         "unit_size=24 (not a power of two)",
     )
     bad += _expect_raises(
         lambda: _call_fused(
-            g, b.to(torch.float16), h, got, E, topk, unit_size, True, 1.0, None, None
+            g,
+            b.to(torch.float16),
+            h,
+            got,
+            E,
+            topk,
+            unit_size,
+            True,
+            1.0,
+            None,
+            None,
+            mode=mode,
         ),
         "fp16 correction bias",
     )
@@ -634,17 +720,17 @@ def check_rejects_bad_shapes(E=320, topk=8, unit_size=16):
     for name, gg, hh in (
         ("fp16 gating", g.to(torch.float16), h),
         ("fp16 hidden", g, h.to(torch.float16)),
-        # [:, :COLS] of a 2*COLS-wide tensor: right shape, wrong row stride.
+        # [:, :cols] of a 2*cols-wide tensor: right shape, wrong row stride.
         ("non-contiguous gating", torch.randn(M, 2 * E, dtype=dtypes.bf16)[:, :E], h),
         (
             "non-contiguous hidden",
             g,
-            torch.randn(M, 2 * COLS, dtype=dtypes.bf16)[:, :COLS],
+            torch.randn(M, 2 * cols, dtype=dtypes.bf16)[:, :cols],
         ),
     ):
         bad += _expect_raises(
             lambda gg=gg, hh=hh: _call_fused(
-                gg, b, hh, got, E, topk, unit_size, True, 1.0, None, None
+                gg, b, hh, got, E, topk, unit_size, True, 1.0, None, None, mode=mode
             ),
             name,
         )
@@ -670,56 +756,66 @@ def _assert_ok(errs, ctx):
 # rows-per-block would leave a tail of rows owned by no block.
 @pytest.mark.parametrize("M", [1, 8, 23, 32, 33, 64, 100, 103, 104, 105, 128])
 @pytest.mark.parametrize("ep", [None, (0, 4, False), (2, 4, False), (2, 4, True)])
-def test_tokens_and_ep(M, ep):
-    errs, _ = _run_case(M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, False)
-    _assert_ok(errs, f"M={M} ep={ep}")
+@pytest.mark.parametrize("mode", MODES)
+def test_tokens_and_ep(mode, M, ep):
+    errs, _ = _run_case(M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, False, mode=mode)
+    _assert_ok(errs, f"{mode} M={M} ep={ep}")
 
 
-def test_small_m_all_experts_masked():
+@pytest.mark.parametrize("mode", MODES)
+def test_small_m_all_experts_masked(mode):
     """M=1 with every routed expert masked out.
 
     The small-M kernel has no expert that owns the token, so a routing-derived
-    owner would leave out_fp4 unwritten. num_valid is 0 here, so phase 3 emits
-    nothing and only the quant prologue covers the row.
+    owner would leave the quantized row unwritten. num_valid is 0 here, so
+    phase 3 emits nothing and only the quant prologue covers the row.
     """
     M, E, topk, unit_size = 1, 320, 8, 16
     mask = torch.zeros(E, dtype=torch.int32)  # this rank owns nothing
     g, b, h = _inputs(M, E, dtypes.bf16, M)
-    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask)
-    got = _alloc(ref, M, topk)
-    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask, mode=mode)
+    got = _alloc(ref, M, topk, mode)
+    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, mode=mode)
     torch.cuda.synchronize()
     assert int(got["nv"][0].item()) == 0, "no owned expert should route no rows"
-    _assert_ok(_compare(ref, got, M, topk, unit_size), "M=1 all-masked")
+    _assert_ok(_compare(ref, got, M, topk, unit_size, mode), f"{mode} M=1 all-masked")
 
 
 @pytest.mark.parametrize("unit_size", [16, 32, 64, 128])
 @pytest.mark.parametrize("M", [1, 64, 128])
-def test_unit_size(M, unit_size):
-    errs, _ = _run_case(M, 320, 8, unit_size, dtypes.bf16, True, 1.0, None, False)
-    _assert_ok(errs, f"M={M} unit_size={unit_size}")
+@pytest.mark.parametrize("mode", MODES)
+def test_unit_size(mode, M, unit_size):
+    errs, _ = _run_case(
+        M, 320, 8, unit_size, dtypes.bf16, True, 1.0, None, False, mode=mode
+    )
+    _assert_ok(errs, f"{mode} M={M} unit_size={unit_size}")
 
 
 @pytest.mark.parametrize("E,topk", [(256, 1), (256, 2), (320, 8), (512, 8)])
 @pytest.mark.parametrize("M", [1, 64, 128])
-def test_experts_and_topk(M, E, topk):
-    errs, _ = _run_case(M, E, topk, 16, dtypes.bf16, True, 1.0, None, False)
-    _assert_ok(errs, f"M={M} E={E} topk={topk}")
+@pytest.mark.parametrize("mode", MODES)
+def test_experts_and_topk(mode, M, E, topk):
+    errs, _ = _run_case(M, E, topk, 16, dtypes.bf16, True, 1.0, None, False, mode=mode)
+    _assert_ok(errs, f"{mode} M={M} E={E} topk={topk}")
 
 
 @pytest.mark.parametrize("need_renorm", [True, False])
 @pytest.mark.parametrize("rsf", [1.0, 2.5])
-def test_renorm_and_scaling(need_renorm, rsf):
-    errs, _ = _run_case(64, 320, 8, 16, dtypes.bf16, need_renorm, rsf, None, False)
-    _assert_ok(errs, f"need_renorm={need_renorm} rsf={rsf}")
+@pytest.mark.parametrize("mode", MODES)
+def test_renorm_and_scaling(mode, need_renorm, rsf):
+    errs, _ = _run_case(
+        64, 320, 8, 16, dtypes.bf16, need_renorm, rsf, None, False, mode=mode
+    )
+    _assert_ok(errs, f"{mode} need_renorm={need_renorm} rsf={rsf}")
 
 
 # The entry dispatches on the real bias dtype rather than coercing it, because
 # reading fp32 through the bf16 layout would silently mis-route.
 @pytest.mark.parametrize("bias_dtype", [dtypes.bf16, dtypes.fp32])
-def test_bias_dtype(bias_dtype):
-    errs, _ = _run_case(64, 320, 8, 16, bias_dtype, True, 1.0, None, False)
-    _assert_ok(errs, f"bias_dtype={bias_dtype}")
+@pytest.mark.parametrize("mode", MODES)
+def test_bias_dtype(mode, bias_dtype):
+    errs, _ = _run_case(64, 320, 8, 16, bias_dtype, True, 1.0, None, False, mode=mode)
+    _assert_ok(errs, f"{mode} bias_dtype={bias_dtype}")
 
 
 # moe_buf reaches the entry unzeroed, so correctness rests on the kernel
@@ -730,20 +826,23 @@ def test_bias_dtype(bias_dtype):
 @pytest.mark.parametrize(
     "ep,n_shared", [(None, 0), (None, 1), ((2, 4, True), 0), ((2, 4, True), 1)]
 )
-def test_moe_buf_zero_fill(M, ep, n_shared):
+@pytest.mark.parametrize("mode", MODES)
+def test_moe_buf_zero_fill(mode, M, ep, n_shared):
     errs, _ = _run_case(
-        M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, True, n_shared=n_shared
+        M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, True, n_shared=n_shared, mode=mode
     )
-    _assert_ok(errs, f"M={M} ep={ep} n_shared={n_shared} moe_buf")
+    _assert_ok(errs, f"{mode} M={M} ep={ep} n_shared={n_shared} moe_buf")
 
 
-def test_barrier_rearms():
-    r = bench_barrier_stress([1, 33, 64, 100, 128], 320, 8, 16, 64)
+@pytest.mark.parametrize("mode", MODES)
+def test_barrier_rearms(mode):
+    r = bench_barrier_stress([1, 33, 64, 100, 128], 320, 8, 16, 64, mode=mode)
     assert r.get("stress_err", 0) == 0, r
 
 
-def test_bad_shapes_rejected():
-    assert check_rejects_bad_shapes() == 0
+@pytest.mark.parametrize("mode", MODES)
+def test_bad_shapes_rejected(mode):
+    assert check_rejects_bad_shapes(mode=mode) == 0
 
 
 # The override is a token count, so it must reject a value that only looks
@@ -771,10 +870,10 @@ def test_fp16_out_dtype_unsupported():
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe_router_supported
 
-    M, E, topk = 16, 320, 8
-    h = torch.randn(M, COLS, dtype=dtypes.bf16)
-    w1 = torch.empty(E, 512, COLS // 2, dtype=dtypes.fp4x2)
-    w2 = torch.empty(E, COLS, 128, dtype=dtypes.fp4x2)
+    M, E, topk, cols = 16, 320, 8, 4096
+    h = torch.randn(M, cols, dtype=dtypes.bf16)
+    w1 = torch.empty(E, 512, cols // 2, dtype=dtypes.fp4x2)
+    w2 = torch.empty(E, cols, 128, dtype=dtypes.fp4x2)
     assert not fused_moe_router_supported(
         h,
         w1,
@@ -797,6 +896,24 @@ def path(request):
     _pin_path(request.param)
     yield "fused" if request.param else "split"
     _unpin_path()
+
+
+# Both widths the TD tiling admits, at the Solar-35B routing shape (E=128,
+# topk=4, block_m 32, fp32 bias). M spans the 1/2-stage heuristic split at 16/17
+# and the phase-3 tail case at 23; the path fixture covers the crossover.
+@pytest.mark.parametrize("M", [1, 8, 16, 17, 23, 64, 104, 128])
+@pytest.mark.parametrize("cols", HIDDEN_DIMS)
+@pytest.mark.parametrize("mode", MODES)
+def test_hidden_dims(path, mode, cols, M):
+    E, topk, unit_size = 128, 4, 32
+    g, b, h = _inputs(M, E, dtypes.fp32, M + cols, cols)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None, mode=mode)
+    got = _alloc_poisoned(ref, M, topk, M, mode)
+    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, None, None, mode=mode)
+    torch.cuda.synchronize()
+    ctx = f"{path} {mode} cols={cols} M={M}"
+    _assert_ok(_compare(ref, got, M, topk, unit_size, mode), ctx)
+    assert not _tail_errs(got, M, topk, unit_size, ctx)
 
 
 # The op test's main sweep stops at num_valid. The downstream stage-1 GEMM
@@ -842,20 +959,21 @@ def _extreme_masks(E):
 
 @pytest.mark.parametrize("mask_name", list(_extreme_masks(320)))
 @pytest.mark.parametrize("M", [1, 33, 128])
-def test_ep_mask_extremes(path, M, mask_name):
+@pytest.mark.parametrize("mode", MODES)
+def test_ep_mask_extremes(path, mode, M, mask_name):
     E, topk, unit_size = 320, 8, 16
     mask = _extreme_masks(E)[mask_name]
     g, b, h = _inputs(M, E, dtypes.bf16, M)
-    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask)
-    got = _alloc_poisoned(ref, M, topk, M)
-    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask, mode=mode)
+    got = _alloc_poisoned(ref, M, topk, M, mode)
+    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, mode=mode)
     torch.cuda.synchronize()
-    ctx = f"{path} {mask_name} M={M}"
-    _assert_ok(_compare(ref, got, M, topk, unit_size), ctx)
+    ctx = f"{path} {mode} {mask_name} M={M}"
+    _assert_ok(_compare(ref, got, M, topk, unit_size, mode), ctx)
     assert not _tail_errs(got, M, topk, unit_size, ctx)
 
 
-def _numerics_inputs(M, E):
+def _numerics_inputs(M, E, cols=4096):
     """Inputs on the quantiser's decision boundaries, not sampled from randn.
 
     All-zero hidden rows drive the e8m0 abs-max reduction to its zero case, and
@@ -863,7 +981,7 @@ def _numerics_inputs(M, E):
     byte is computed rather than copied.
     """
     torch.manual_seed(0)
-    hn = torch.randn(M, COLS, dtype=dtypes.bf16)
+    hn = torch.randn(M, cols, dtype=dtypes.bf16)
     gr = torch.randn(M, E, dtype=dtypes.bf16)
     gz = torch.zeros(M, E, dtype=dtypes.bf16)
     bd = _tie_free_bias(E)
@@ -874,18 +992,18 @@ def _numerics_inputs(M, E):
     gs[:, :8] = 10.0
     # One zero row among live rows: the zero-scale case must not contaminate
     # its neighbours in the swizzled scale tile.
-    hm = torch.randn(M, COLS, dtype=dtypes.bf16)
+    hm = torch.randn(M, cols, dtype=dtypes.bf16)
     hm[::2] = 0
     # Per-group magnitude swing: adjacent groups land on far apart exponents,
     # which is what the shuffle has to keep straight.
-    hg = torch.randn(M, COLS, dtype=dtypes.bf16) * (
+    hg = torch.randn(M, cols, dtype=dtypes.bf16) * (
         2.0
-        ** torch.randint(-30, 30, (1, COLS // GROUP_SIZE))
+        ** torch.randint(-30, 30, (1, cols // GROUP_SIZE))
         .repeat_interleave(GROUP_SIZE, 1)
         .to(dtypes.bf16)
     )
     # One group huge: the abs-max must not leak across the group boundary.
-    hs = torch.randn(M, COLS, dtype=dtypes.bf16)
+    hs = torch.randn(M, cols, dtype=dtypes.bf16)
     hs[:, GROUP_SIZE : 2 * GROUP_SIZE] = 50000.0
     return {
         "gating_single_hot": (gs, bd, hn),
@@ -893,24 +1011,85 @@ def _numerics_inputs(M, E):
         # the bias -- the value the fp32/bf16 dispatch reads differently.
         "bias_decides": (gz, bd, hn),
         "bias_fp32": (gz, bd.to(torch.float32), hn),
-        "hidden_zero": (gr, bd, torch.zeros(M, COLS, dtype=dtypes.bf16)),
+        "hidden_zero": (gr, bd, torch.zeros(M, cols, dtype=dtypes.bf16)),
         "hidden_half_zero": (gr, bd, hm),
-        "hidden_huge": (gr, bd, torch.full((M, COLS), 60000.0, dtype=dtypes.bf16)),
-        "hidden_tiny": (gr, bd, torch.full((M, COLS), 1e-38, dtype=dtypes.bf16)),
+        "hidden_huge": (gr, bd, torch.full((M, cols), 60000.0, dtype=dtypes.bf16)),
+        "hidden_tiny": (gr, bd, torch.full((M, cols), 1e-38, dtype=dtypes.bf16)),
         "hidden_group_swing": (gr, bd, hg),
         "hidden_one_group_huge": (gr, bd, hs),
     }
 
 
 @pytest.mark.parametrize("case", list(_numerics_inputs(1, 320)))
-def test_adversarial_numerics(path, case):
+@pytest.mark.parametrize("mode", MODES)
+def test_adversarial_numerics(path, mode, case):
     M, E, topk, unit_size = 64, 320, 8, 16
     g, b, h = _numerics_inputs(M, E)[case]
-    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None)
-    got = _alloc_poisoned(ref, M, topk, 3)
-    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, None, None)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None, mode=mode)
+    got = _alloc_poisoned(ref, M, topk, 3, mode)
+    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, None, None, mode=mode)
     torch.cuda.synchronize()
-    _assert_ok(_compare(ref, got, M, topk, unit_size), f"{path} {case}")
+    _assert_ok(_compare(ref, got, M, topk, unit_size, mode), f"{path} {mode} {case}")
+
+
+def _fp8_edge_rows(M, cols):
+    """Hidden rows on per-token FP8's decision points, one kind per case.
+
+    The row abs-max sets the scale and every element is divided by it, so the
+    cases probe the reduction (zero, outlier, sign), the fp32 reciprocal at the
+    bf16 range ends, and the e4m3 conversion's rounding and saturation.
+    """
+    torch.manual_seed(0)
+    r = torch.randn(M, cols, dtype=dtypes.bf16)
+    bf16 = torch.finfo(dtypes.bf16)
+    outlier = r.clone()
+    outlier[:, cols // 3] = 3.0e4
+    alt = torch.ones(M, cols, dtype=dtypes.bf16)
+    alt[:, 1::2] = -1
+    alt *= torch.arange(1, M + 1, dtype=dtypes.bf16).view(-1, 1)
+    # A row max of 448 puts the scale at ~1, so 1.0625 and 1.1875 land near
+    # the midpoints between the e4m3 values 1, 1.125 and 1.25.
+    mid = torch.tensor([448.0, 1.0625, 1.1875, 3.25, -17.0, 0.0078125])
+    mid = mid.to(dtypes.bf16).repeat(cols // mid.numel() + 1)[:cols]
+    one = torch.zeros(M, cols, dtype=dtypes.bf16)
+    one[:, 7] = 1.0
+    # Row-wise mixes, so one call covers every kind next to its neighbours.
+    mixed = r.clone()
+    mixed[0::4] = 0
+    mixed[1::4] *= 1e-30
+    mixed[2::4] = -mixed[2::4] * 1e30
+    return {
+        "zero": torch.zeros(M, cols, dtype=dtypes.bf16),
+        "neg_zero": torch.full((M, cols), -0.0, dtype=dtypes.bf16),
+        "one_nonzero": one,
+        "tiny": r * 1e-30,
+        "huge": (r.float().sign() * 3.0e38).to(dtypes.bf16),
+        "bf16_max": torch.full((M, cols), -bf16.max, dtype=dtypes.bf16),
+        "subnormal": torch.full((M, cols), bf16.smallest_normal / 4, dtype=dtypes.bf16),
+        "outlier": outlier,
+        "alternating_sign": alt,
+        "rounding_midpoints": mid.view(1, -1).expand(M, -1).contiguous(),
+        "mixed_rows": mixed,
+    }
+
+
+# Per-token FP8 against per_token_quant_hip, exact bytes and scale bits. On an
+# all-zero row stock emits scale 0 and every byte 0xfe (-448, what the
+# saturating convert makes of 0 * rcp(0)), not zeros; pinned for the router.
+@pytest.mark.parametrize("case", list(_fp8_edge_rows(4, 2048)))
+@pytest.mark.parametrize("cols", HIDDEN_DIMS)
+def test_fp8_edge_rows(cols, case):
+    M, E, topk, unit_size = 16, 128, 4, 32
+    h = _fp8_edge_rows(M, cols)[case]
+    g, b, _ = _inputs(M, E, dtypes.fp32, 0, cols)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None, mode=FP8)
+    got = _alloc_poisoned(ref, M, topk, 1, FP8)
+    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, None, None, mode=FP8)
+    torch.cuda.synchronize()
+    _assert_ok(_compare(ref, got, M, topk, unit_size, FP8), f"cols={cols} {case}")
+    if case in ("zero", "neg_zero"):
+        assert bool((got["a1s"].view(torch.int32) == 0).all()), got["a1s"]
+        assert bool((got["a1"].view(torch.uint8) == 0xFE).all())
 
 
 def _tie_gatings(M, E, topk):
@@ -936,7 +1115,7 @@ def test_gating_ties(path, case):
     g = _tie_gatings(M, E, topk)[case]
     b = torch.zeros(E, dtype=dtypes.bf16)
     torch.manual_seed(0)
-    h = torch.randn(M, COLS, dtype=dtypes.bf16)
+    h = torch.randn(M, 4096, dtype=dtypes.bf16)
     ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None)
     got = _alloc_poisoned(ref, M, topk, 5)
     _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, None, None)
@@ -993,27 +1172,29 @@ def test_shape_boundaries(path, M, unit_size, topk):
 # The two launch paths share device code and differ only in where the barrier
 # is, so any divergence localises the bug to the barrier, not to the routing.
 @pytest.mark.parametrize("M", [1, 16, 33, 64, 100, 103, 104, 128, 200])
-def test_fused_split_agree(M):
+@pytest.mark.parametrize("mode", MODES)
+def test_fused_split_agree(mode, M):
     E, topk, unit_size = 320, 8, 16
     g, b, h = _inputs(M, E, dtypes.bf16, M)
-    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None)
-    keys = ("ti", "tw", "sids", "sw", "seids", "nv", "o4", "osc")
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None, mode=mode)
     outs = {}
     try:
         for fused in (True, False):
             _pin_path(fused)
-            got = _alloc_poisoned(ref, M, topk, M)
-            _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, None, None)
+            got = _alloc_poisoned(ref, M, topk, M, mode)
+            _call_fused(
+                g, b, h, got, E, topk, unit_size, True, 1.0, None, None, mode=mode
+            )
             torch.cuda.synchronize()
-            outs[fused] = {k: got[k].clone() for k in keys}
+            outs[fused] = {k: got[k].clone() for k in KEYS}
     finally:
         _unpin_path()
     diff = {
         k: int((outs[True][k] != outs[False][k]).sum())
-        for k in keys
+        for k in KEYS
         if not torch.equal(outs[True][k], outs[False][k])
     }
-    assert not diff, f"M={M}: fused and split differ in {diff}"
+    assert not diff, f"{mode} M={M}: fused and split differ in {diff}"
 
 
 # The workspace is allocated by host code that runs only at capture time, so
@@ -1024,7 +1205,6 @@ def test_fused_split_agree(M):
 # require the small graph to keep replaying correctly.
 def test_graph_replay_survives_workspace_growth():
     E, topk, unit_size = 320, 8, 16
-    keys = ("ti", "tw", "sids", "sw", "seids", "nv", "o4", "osc")
     stream = torch.cuda.Stream()
     # One pool shared by every capture, as vLLM does: a private per-graph pool
     # is never handed out, so a freed block could not be reused and the test
@@ -1051,7 +1231,7 @@ def test_graph_replay_survives_workspace_growth():
 
     for M, (graph, ref, got, _keep) in graphs.items():
         for r in range(8):
-            for k in keys:
+            for k in KEYS:
                 _fill_pat(got[k], r)
             got["nv"].zero_()
             graph.replay()
@@ -1070,28 +1250,53 @@ def test_graph_replay_survives_workspace_growth():
 
 @pytest.mark.parametrize("n_shared", [1])
 @pytest.mark.parametrize("M", [1, 8, 33, 64, 103, 104, 128])
-def test_shared_non_ep(M, n_shared):
+@pytest.mark.parametrize("mode", MODES)
+def test_shared_non_ep(mode, M, n_shared):
     errs, _ = _run_case(
-        M, 320, 8, 16, dtypes.bf16, True, 1.0, None, False, n_shared=n_shared
+        M,
+        320,
+        8,
+        16,
+        dtypes.bf16,
+        True,
+        1.0,
+        None,
+        False,
+        n_shared=n_shared,
+        mode=mode,
     )
-    _assert_ok(errs, f"M={M} n_shared={n_shared}")
+    _assert_ok(errs, f"{mode} M={M} n_shared={n_shared}")
 
 
 @pytest.mark.parametrize("n_shared", [1])
 @pytest.mark.parametrize("ep", [(0, 4, True), (2, 4, True), (3, 4, True), (0, 1, True)])
 @pytest.mark.parametrize("M", [1, 33, 128])
-def test_shared_ep(path, M, ep, n_shared):
+@pytest.mark.parametrize("cols", HIDDEN_DIMS)
+@pytest.mark.parametrize("mode", MODES)
+def test_shared_ep(path, mode, cols, M, ep, n_shared):
     errs, _ = _run_case(
-        M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, False, n_shared=n_shared
+        M,
+        320,
+        8,
+        16,
+        dtypes.bf16,
+        True,
+        1.0,
+        ep,
+        False,
+        n_shared=n_shared,
+        mode=mode,
+        cols=cols,
     )
-    _assert_ok(errs, f"{path} M={M} ep={ep} n_shared={n_shared}")
+    _assert_ok(errs, f"{path} {mode} cols={cols} M={M} ep={ep} n_shared={n_shared}")
 
 
 # The shared weight is not renormalized and not scaled by rsf: the kernel
 # writes it after the renorm block, so a routed-weight change must not move it.
 @pytest.mark.parametrize("need_renorm,rsf", [(True, 1.0), (True, 2.5), (False, 2.5)])
 @pytest.mark.parametrize("shared_w", [1.0, 0.4])
-def test_shared_weight_untouched_by_renorm(need_renorm, rsf, shared_w):
+@pytest.mark.parametrize("mode", MODES)
+def test_shared_weight_untouched_by_renorm(mode, need_renorm, rsf, shared_w):
     M, E, topk, n_shared = 64, 320, 8, 1
     errs, (_g, _b, _h, _ref, got, _m) = _run_case(
         M,
@@ -1105,8 +1310,9 @@ def test_shared_weight_untouched_by_renorm(need_renorm, rsf, shared_w):
         False,
         n_shared=n_shared,
         shared_w=shared_w,
+        mode=mode,
     )
-    _assert_ok(errs, f"renorm={need_renorm} rsf={rsf} w={shared_w}")
+    _assert_ok(errs, f"{mode} renorm={need_renorm} rsf={rsf} w={shared_w}")
     tail = got["tw"][:, topk:]
     assert torch.allclose(tail, torch.full_like(tail, shared_w)), tail
 
@@ -1119,7 +1325,8 @@ def test_shared_weight_untouched_by_renorm(need_renorm, rsf, shared_w):
 @pytest.mark.parametrize("M", [3, 33, 128])
 @pytest.mark.parametrize("ep_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("n_shared", [1])
-def test_shared_no_double_count(ep_size, n_shared, M):
+@pytest.mark.parametrize("mode", MODES)
+def test_shared_no_double_count(mode, ep_size, n_shared, M):
     E, topk, unit_size = 320, 8, 16
     g, b, h = _inputs(M, E, dtypes.bf16, 0)
     counts = torch.zeros(M, n_shared, dtype=torch.int64, device="cpu")
@@ -1140,8 +1347,9 @@ def test_shared_no_double_count(ep_size, n_shared, M):
             1.0,
             ep_rank,
             ep_size,
+            mode,
         )
-        got = _alloc_poisoned(ref, M, topk + n_shared, ep_rank)
+        got = _alloc_poisoned(ref, M, topk + n_shared, ep_rank, mode)
         _call_fused(
             g,
             b,
@@ -1158,6 +1366,7 @@ def test_shared_no_double_count(ep_size, n_shared, M):
             1.0,
             ep_rank,
             ep_size,
+            mode,
         )
         torch.cuda.synchronize()
         tail = got["ti"][:, topk:]
@@ -1167,7 +1376,7 @@ def test_shared_no_double_count(ep_size, n_shared, M):
         assert bool(((tail == want) | (tail == E + n_shared)).all()), tail
         counts += (tail == want).to(torch.int64).cpu()
     assert bool((counts == 1).all()), (
-        f"ep_size={ep_size} n_shared={n_shared}: shared rows per token "
+        f"{mode} ep_size={ep_size} n_shared={n_shared}: shared rows per token "
         f"min={int(counts.min())} max={int(counts.max())}, expected exactly 1"
     )
 
@@ -1176,52 +1385,86 @@ def test_shared_no_double_count(ep_size, n_shared, M):
 # existed: the shared lanes fold out and nothing about the output moves.
 @pytest.mark.parametrize("ep", [None, (2, 4, True)])
 @pytest.mark.parametrize("M", [1, 64, 128])
-def test_nshared_zero_unchanged(M, ep):
+@pytest.mark.parametrize("mode", MODES)
+def test_nshared_zero_unchanged(mode, M, ep):
     E, topk, unit_size = 320, 8, 16
     mask = None if ep is None else _make_mask(E, ep[0], ep[1], vllm_shape=ep[2])
     g, b, h = _inputs(M, E, dtypes.bf16, M)
-    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask)
-    keys = ("ti", "tw", "sids", "sw", "seids", "nv", "o4", "osc")
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask, mode=mode)
     outs = []
     # Defaulted vs explicitly-zero shared args, and under ep_size 1 either way.
     for kwargs in ({}, {"n_shared": 0, "shared_w": 1.0, "ep_rank": 0, "ep_size": 1}):
-        got = _alloc_poisoned(ref, M, topk, M)
-        _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **kwargs)
+        got = _alloc_poisoned(ref, M, topk, M, mode)
+        _call_fused(
+            g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **kwargs, mode=mode
+        )
         torch.cuda.synchronize()
-        outs.append({k: got[k].clone() for k in keys})
-    diff = [k for k in keys if not torch.equal(outs[0][k], outs[1][k])]
-    assert not diff, f"M={M} ep={ep}: explicit zero-shared args changed {diff}"
-    _assert_ok(_compare(ref, outs[0], M, topk, unit_size), f"M={M} ep={ep}")
+        outs.append({k: got[k].clone() for k in KEYS})
+    diff = [k for k in KEYS if not torch.equal(outs[0][k], outs[1][k])]
+    assert not diff, f"{mode} M={M} ep={ep}: explicit zero-shared args changed {diff}"
+    _assert_ok(
+        _compare(ref, outs[0], M, topk, unit_size, mode), f"{mode} M={M} ep={ep}"
+    )
 
 
 @pytest.mark.parametrize("unit_size", [16, 32, 128])
 @pytest.mark.parametrize("M", [1, 23, 64, 128])
-def test_shared_tail_fill_exact(path, M, unit_size):
+@pytest.mark.parametrize("mode", MODES)
+def test_shared_tail_fill_exact(path, mode, M, unit_size):
     topk, n_shared = 8, 1
     _, (_g, _b, _h, _ref, got, _m) = _run_case(
-        M, 320, topk, unit_size, dtypes.bf16, True, 1.0, None, False, n_shared=n_shared
+        M,
+        320,
+        topk,
+        unit_size,
+        dtypes.bf16,
+        True,
+        1.0,
+        None,
+        False,
+        n_shared=n_shared,
+        mode=mode,
     )
-    ctx = f"{path} M={M} u={unit_size} n_shared={n_shared}"
+    ctx = f"{path} {mode} M={M} u={unit_size} n_shared={n_shared}"
     assert not _tail_errs(got, M, topk + n_shared, unit_size, ctx)
 
 
 # Phase 1 places the shared rows on the lanes just past topk, inside the one
 # wave the selection runs in, so topk + n_shared must fit in 64.
 @pytest.mark.parametrize("topk,n_shared,ok", [(63, 1, True), (64, 1, False)])
-def test_shared_topk_total_boundary(topk, n_shared, ok):
+@pytest.mark.parametrize("mode", MODES)
+def test_shared_topk_total_boundary(mode, topk, n_shared, ok):
     M, E, unit_size = 8, 320, 16
     g, b, h = _inputs(M, E, dtypes.bf16, 0)
     ref = _run_stock(
-        g, b, h, M, E, topk, unit_size, True, 1.0, None, n_shared, 1.0, 0, 1
+        g, b, h, M, E, topk, unit_size, True, 1.0, None, n_shared, 1.0, 0, 1, mode
     )
-    got = _alloc(ref, M, topk + n_shared)
+    got = _alloc(ref, M, topk + n_shared, mode)
     call = lambda: _call_fused(
-        g, b, h, got, E, topk, unit_size, True, 1.0, None, None, n_shared, 1.0, 0, 1
+        g,
+        b,
+        h,
+        got,
+        E,
+        topk,
+        unit_size,
+        True,
+        1.0,
+        None,
+        None,
+        n_shared,
+        1.0,
+        0,
+        1,
+        mode,
     )
     if ok:
         call()
         torch.cuda.synchronize()
-        _assert_ok(_compare(ref, got, M, topk + n_shared, unit_size), f"topk={topk}")
+        _assert_ok(
+            _compare(ref, got, M, topk + n_shared, unit_size, mode),
+            f"{mode} topk={topk}",
+        )
     else:
         with pytest.raises(RuntimeError):
             call()
@@ -1242,7 +1485,8 @@ def test_shared_topk_total_boundary(topk, n_shared, ok):
         (513, 1, None, False),
     ],
 )
-def test_expert_slot_cap(E, n_shared, ep, ok):
+@pytest.mark.parametrize("mode", MODES)
+def test_expert_slot_cap(mode, E, n_shared, ep, ok):
     M, topk, unit_size = 8, 8, 16
     ep_rank, ep_size = (0, 1) if ep is None else (ep[0], ep[1])
     mask = None if ep is None else _make_mask(E, ep_rank, ep_size, n_shared=n_shared)
@@ -1252,37 +1496,42 @@ def test_expert_slot_cap(E, n_shared, ep, ok):
         "shared_w": 1.0,
         "ep_rank": ep_rank,
         "ep_size": ep_size,
+        "mode": mode,
     }
     if not ok:
-        ref = _run_stock(g, b, h, M, 320, topk, unit_size, True, 1.0, None)
-        got = _alloc(ref, M, topk + n_shared)
+        ref = _run_stock(g, b, h, M, 320, topk, unit_size, True, 1.0, None, mode=mode)
+        got = _alloc(ref, M, topk + n_shared, mode)
         with pytest.raises(RuntimeError):
             _call_fused(
                 g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **shared
             )
         return
     ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask, **shared)
-    got = _alloc(ref, M, topk + n_shared)
+    got = _alloc(ref, M, topk + n_shared, mode)
     _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **shared)
     torch.cuda.synchronize()
-    _assert_ok(_compare(ref, got, M, topk + n_shared, unit_size), f"E={E}")
+    _assert_ok(
+        _compare(ref, got, M, topk + n_shared, unit_size, mode), f"{mode} E={E}"
+    )
 
 
-def test_shared_bad_args_rejected():
+@pytest.mark.parametrize("mode", MODES)
+def test_shared_bad_args_rejected(mode):
     """Configurations the entry cannot serve must be refused, not mis-routed."""
     M, E, topk, unit_size, n_shared = 16, 320, 8, 16, 1
     g, b, h = _inputs(M, E, dtypes.bf16, 0)
     mask = _make_mask(E, 0, 4, n_shared=n_shared)
     ref = _run_stock(
-        g, b, h, M, E, topk, unit_size, True, 1.0, mask, n_shared, 1.0, 0, 4
+        g, b, h, M, E, topk, unit_size, True, 1.0, mask, n_shared, 1.0, 0, 4, mode
     )
-    got = _alloc(ref, M, topk + n_shared)
+    got = _alloc(ref, M, topk + n_shared, mode)
 
     def call(**kw):
         kw = {"n_shared": n_shared, "shared_w": 1.0, "ep_rank": 0, "ep_size": 4, **kw}
         a = kw.pop("outs", got)
         m = kw.pop("mask", mask)
-        _call_fused(g, b, h, a, E, topk, unit_size, True, 1.0, m, None, **kw)
+        _call_fused(g, b, h, a, E, topk, unit_size, True, 1.0, m, None, **kw, mode=mode)
+        torch.cuda.synchronize()
 
     # More shared experts than the kernel instantiates.
     with pytest.raises(RuntimeError):
@@ -1292,6 +1541,9 @@ def test_shared_bad_args_rejected():
         call(ep_rank=4)
     with pytest.raises(RuntimeError):
         call(ep_rank=-1)
+    # ep_rank/ep_size are only read under shared fusion, and EP callers pass
+    # them whether or not shared experts are fused, so this must be accepted.
+    call(n_shared=0)
     # ep_size > 1 with no mask has no sentinel slot for a non-owner to park on.
     with pytest.raises(RuntimeError):
         call(mask=None)
@@ -1322,7 +1574,7 @@ def test_config_supported_scalar_gate():
 
     ask = lambda **kw: fused_moe_router_config_supported(
         **{
-            "hidden_dim": COLS,
+            "hidden_dim": 4096,
             "hidden_dtype": dtypes.bf16,
             "w1_dtype": dtypes.fp4x2,
             "quant_type": QuantType.per_1x32.value,
@@ -1355,8 +1607,8 @@ def test_global_num_experts_derivations():
     from aiter.fused_moe import FUSED_MOE_ROUTER_MAX_EXPERTS
     from aiter.fused_moe import fused_moe_router_supported as ask
 
-    M, E, topk, n_shared = 16, 320, 8, 1
-    h = torch.randn(M, COLS, dtype=dtypes.bf16)
+    M, E, topk, n_shared, cols = 16, 320, 8, 1, 4096
+    h = torch.randn(M, cols, dtype=dtypes.bf16)
     base = {
         "quant_type": QuantType.per_1x32.value,
         "activation": ActivationType.Silu.value,
@@ -1364,8 +1616,8 @@ def test_global_num_experts_derivations():
 
     def w(local_E):
         return (
-            torch.empty(local_E, 512, COLS // 2, dtype=dtypes.fp4x2),
-            torch.empty(local_E, COLS, 128, dtype=dtypes.fp4x2),
+            torch.empty(local_E, 512, cols // 2, dtype=dtypes.fp4x2),
+            torch.empty(local_E, cols, 128, dtype=dtypes.fp4x2),
         )
 
     # Explicit: taken as given, whatever the shapes imply.
@@ -1410,10 +1662,10 @@ def test_shared_supported_gate():
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe_router_supported
 
-    M, E, topk = 16, 320, 8
-    h = torch.randn(M, COLS, dtype=dtypes.bf16)
-    w1 = torch.empty(E, 512, COLS // 2, dtype=dtypes.fp4x2)
-    w2 = torch.empty(E, COLS, 128, dtype=dtypes.fp4x2)
+    M, E, topk, cols = 16, 320, 8, 4096
+    h = torch.randn(M, cols, dtype=dtypes.bf16)
+    w1 = torch.empty(E, 512, cols // 2, dtype=dtypes.fp4x2)
+    w2 = torch.empty(E, cols, 128, dtype=dtypes.fp4x2)
     ask = lambda tk, ns: fused_moe_router_supported(
         h,
         w1,
@@ -1445,6 +1697,468 @@ def test_cfg_topk_matches_stock(ep, n_shared):
     # What vLLM allocates for the stock path (init_aiter_topK_meta_data).
     stock_width = topk + n_shared + (1 if (ep and n_shared) else 0)
     assert _cfg_topk(topk, n_shared, mask) == stock_width
+
+
+# MXFP4 is fused on the 2-stage path only; a config that picks 1-stage must
+# decline even though FP8 per-token now fuses its 1-stage path.
+def test_mxfp4_1stage_refused(monkeypatch):
+    from aiter import ActivationType
+    import aiter.fused_moe as fm
+
+    M, E, topk, cols = 16, 320, 8, 4096
+    h = torch.randn(M, cols, dtype=dtypes.bf16)
+    w1 = torch.empty(E, 512, cols // 2, dtype=dtypes.fp4x2)
+    w2 = torch.empty(E, cols, 128, dtype=dtypes.fp4x2)
+    ask = lambda: fm.fused_moe_router_supported(
+        h,
+        w1,
+        w2,
+        topk,
+        quant_type=QuantType.per_1x32.value,
+        activation=ActivationType.Silu.value,
+    )
+    assert ask()
+    real = fm.get_2stage_cfgs
+    monkeypatch.setattr(
+        fm,
+        "get_2stage_cfgs",
+        lambda *a, **k: dataclasses.replace(real(*a, **k), run_1stage=True),
+    )
+    assert not ask()
+
+
+# FP8 per-token gates at the Solar-35B MoE shape. The default heuristic runs
+# 2-stage up to M=16 and 1-stage fmoe_g1u1 from M=17 on; both are fused, FLAT
+# is not. The stage1_* cases force a 1-stage config that fused_moe_1stage would
+# not hand to fmoe_g1u1 as-is.
+_FP8_GATES = {
+    "M1": (1, {}, True),
+    "M16": (16, {}, True),
+    "n_shared1": (16, dict(num_fused_shared_experts=1), True),
+    "M17_1stage": (17, {}, True),
+    "M64_1stage": (64, {}, True),
+    "M128_1stage": (128, {}, True),
+    "M64_1stage_n_shared1": (64, dict(num_fused_shared_experts=1), True),
+    "M8_forced_1stage": (8, dict(stage1="1stage"), True),
+    "stage1_xbf16": (64, dict(stage1="xbf16"), False),
+    "stage1_not_fused_moe_1stage": (64, dict(stage1="other"), False),
+    "stage1_flat": (64, dict(flat=True), False),
+    "g1u0_1stage": (64, dict(g1u0=True, stage1="1stage"), False),
+    "M129_token_cap": (129, {}, False),
+    "n_shared2": (16, dict(num_fused_shared_experts=2), False),
+    "per_1x128": (16, dict(quant_type=QuantType.per_1x128.value), False),
+    "per_Tensor": (16, dict(quant_type=QuantType.per_Tensor.value), False),
+    "per_1x32_fp8_weights": (16, dict(quant_type=QuantType.per_1x32.value), False),
+    "doweight_stage1": (16, dict(doweight_stage1=True), False),
+    "static_a1_scale": (16, dict(a1_scale=1.0), False),
+    "fp16_out": (16, dict(dtype=dtypes.fp16), False),
+    "flat_cfg": (16, dict(flat=True), False),
+}
+
+
+@pytest.mark.parametrize("case", list(_FP8_GATES))
+def test_fp8_supported_gate(case, monkeypatch):
+    from aiter import ActivationType
+    import aiter.fused_moe as fm
+
+    M, kw, want = _FP8_GATES[case]
+    kw = dict(kw)
+    E, dim, inter = 128, 2048, 1024
+    ns = kw.get("num_fused_shared_experts", 0)
+    # w1/w2 hold routed plus shared experts, as the caller would pass them.
+    gu = 1 if kw.pop("g1u0", False) else 2
+    w1 = torch.empty(E + ns, gu * inter, dim, dtype=dtypes.fp8)
+    w2 = torch.empty(E + ns, dim, inter, dtype=dtypes.fp8)
+    w1.is_shuffled = w2.is_shuffled = True
+    if "a1_scale" in kw:
+        kw["a1_scale"] = torch.full((1,), kw["a1_scale"], dtype=dtypes.fp32)
+    real = fm.get_2stage_cfgs
+    one = real(32, dim, inter, E, 4, dtypes.bf16, dtypes.fp8, dtypes.fp8,
+               QuantType.per_Token, True, ActivationType.Silu, False, 0, 0, True,
+               "separated", is_ep=False)
+    assert one.run_1stage and one.stage1.func is fm.fused_moe_1stage
+    stage1 = {
+        "1stage": one.stage1,
+        "xbf16": functools.partial(one.stage1, xbf16=True),
+        "other": functools.partial(fm.asm_stage1, **one.stage1.keywords),
+    }.get(kw.pop("stage1", None))
+    if kw.pop("flat", False):
+        # No tuned config selects FLAT at this shape; force the flag instead.
+        monkeypatch.setattr(
+            fm,
+            "get_2stage_cfgs",
+            lambda *a, **k: dataclasses.replace(real(*a, **k), flat=True),
+        )
+    elif stage1 is not None:
+        forced = dataclasses.replace(one, stage1=stage1)
+        monkeypatch.setattr(fm, "get_2stage_cfgs", lambda *a, **k: forced)
+    kw.setdefault("quant_type", QuantType.per_Token.value)
+    h = torch.empty(M, dim, dtype=dtypes.bf16)
+    got = fm.fused_moe_router_supported(
+        h, w1, w2, 4, activation=ActivationType.Silu.value, **kw
+    )
+    assert got == want, f"{case}: supported={got}, expected {want}"
+
+
+@pytest.mark.parametrize("n_shared,want", [(0, True), (1, True), (2, False)])
+def test_fp8_config_gate(n_shared, want):
+    from aiter import ActivationType
+    from aiter.fused_moe import fused_moe_router_config_supported
+
+    for dim in HIDDEN_DIMS:
+        got = fused_moe_router_config_supported(
+            dim,
+            dtypes.bf16,
+            dtypes.fp8,
+            quant_type=QuantType.per_Token.value,
+            activation=ActivationType.Silu.value,
+            num_fused_shared_experts=n_shared,
+        )
+        assert got == want, f"dim={dim} n_shared={n_shared}: {got}"
+
+
+def _fp8_bad_args(M, cols):
+    """Overrides the entry must refuse in FP8 mode: buffer dtypes and layouts,
+    quant_type / out_q dtype pairs that name no instantiated mode, and the
+    group_size the entry divides by in every mode."""
+    return {
+        "fp4x2_out_q": dict(a1=torch.empty(M, cols // 2, dtype=dtypes.fp4x2)),
+        "uint8_out_q": dict(a1=torch.empty(M, cols, dtype=torch.uint8)),
+        "e4m3fnuz_out_q": dict(a1=torch.empty(M, cols, dtype=torch.float8_e4m3fnuz)),
+        "bf16_out_scale": dict(a1s=torch.empty(M, 1, dtype=dtypes.bf16)),
+        "undersized_out_q": dict(a1=torch.empty(M, cols // 2, dtype=dtypes.fp8)),
+        "undersized_out_scale": dict(a1s=torch.empty(M - 1, 1, dtype=dtypes.fp32)),
+        "strided_out_q": dict(a1=torch.empty(M, 2 * cols, dtype=dtypes.fp8)[:, :cols]),
+        "strided_out_scale": dict(a1s=torch.empty(M, 2, dtype=dtypes.fp32)[:, :1]),
+        # MXFP8 is per_1x32 with fp8 out, not instantiated yet.
+        "per_1x32_fp8_out": dict(quant_type=QuantType.per_1x32.value),
+        "per_1x128": dict(quant_type=QuantType.per_1x128.value),
+        "per_Tensor": dict(quant_type=QuantType.per_Tensor.value),
+        "quant_type_99": dict(quant_type=99),
+        "group_size_0": dict(group_size=0),
+    }
+
+
+@pytest.mark.parametrize("case", list(_fp8_bad_args(4, 2048)))
+def test_fp8_bad_args_rejected(case):
+    M, E, topk, unit_size, cols = 16, 128, 4, 32, 2048
+    g, b, h = _inputs(M, E, dtypes.fp32, 0, cols)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None, mode=FP8)
+    over = _fp8_bad_args(M, cols)[case]
+    a = _alloc(ref, M, topk, FP8)
+    a.update({k: v for k, v in over.items() if k in a})
+    quant_type = over.get("quant_type", QuantType.per_Token.value)
+    group_size = over.get("group_size", GROUP_SIZE)
+    # The torch-free binding has no AiterDtype for e4m3fnuz on gfx950, so that
+    # buffer is refused while converting, before the entry runs.
+    exc = AssertionError if case == "e4m3fnuz_out_q" else RuntimeError
+    with pytest.raises(exc):
+        fused_moe_router_impl(
+            g,
+            b,
+            h,
+            a["ti"],
+            a["tw"],
+            a["sids"],
+            a["sw"],
+            a["seids"],
+            a["nv"],
+            a["a1"],
+            a["a1s"],
+            E,
+            topk,
+            unit_size,
+            group_size,
+            True,
+            1.0,
+            get_fused_moe_router_workspace(g.device, WORKSPACE_MAX_TOKENS),
+            quant_type=quant_type,
+        )
+        torch.cuda.synchronize()
+
+
+# An empty batch has nothing to route; the entry must refuse it cleanly rather
+# than launch a zero-sized grid.
+@pytest.mark.parametrize("mode", MODES)
+def test_zero_tokens_rejected(mode):
+    E, topk, unit_size, cols = 128, 4, 32, 2048
+    g, b, h = _inputs(1, E, dtypes.fp32, 0, cols)
+    ref = _run_stock(g, b, h, 1, E, topk, unit_size, True, 1.0, None, mode=mode)
+    got = _alloc(ref, 1, topk, mode)
+    with pytest.raises(RuntimeError, match="positive"):
+        _call_fused(
+            g[:0], b, h[:0], got, E, topk, unit_size, True, 1.0, None, None, mode=mode
+        )
+        torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Whole MoE, FP8 per-token: fused_moe_router vs biased_grouped_topk ->
+# fused_moe_ at the Solar-35B shape. From M=17 the default heuristic runs
+# 1-stage, where the router's a1 and token-indexed scale go straight to
+# fmoe_g1u1. Stage 2 and fmoe_g1u1 accumulate with atomics, so outputs are
+# held to the stock-vs-stock spread; the fmoe_g1u1 inputs must match exactly.
+# ---------------------------------------------------------------------------
+
+MOE_E, MOE_TOPK, MOE_DIM, MOE_INTER = 128, 4, 2048, 1024
+
+
+@functools.lru_cache(maxsize=1)
+def _fp8_moe_weights():
+    from aiter.ops.shuffle import shuffle_weight
+
+    torch.manual_seed(0)
+    ws = []
+    for shape in ((MOE_E, 2 * MOE_INTER, MOE_DIM), (MOE_E, MOE_DIM, MOE_INTER)):
+        w = torch.randn(shape, dtype=dtypes.bf16) / 16
+        wq, wscale = aiter.pertoken_quant(w, quant_dtype=dtypes.fp8)
+        wq = shuffle_weight(wq, layout=(16, 16))
+        wq.is_shuffled = True
+        ws += [wq, wscale]
+    w1, w1s, w2, w2s = ws
+    return w1, w2, w1s, w2s
+
+
+def _moe_inputs(M, seed, zero_rows=()):
+    torch.manual_seed(seed)
+    h = torch.randn(M, MOE_DIM, dtype=dtypes.bf16)
+    h[list(zero_rows)] = 0.0
+    g = torch.randn(M, MOE_E, dtype=dtypes.bf16)
+    # bf16-representable, so the stock path's bf16 cast of the bias is exact.
+    b = torch.randn(MOE_E, dtype=dtypes.bf16).to(dtypes.fp32)
+    return h, g, b
+
+
+def _moe_stock(h, g, b, w1, w2, w1s, w2s, n_shared=0):
+    from aiter import ActivationType
+    from aiter.fused_moe import fused_moe_
+
+    M = h.shape[0]
+    tw = torch.empty(M, MOE_TOPK, dtype=dtypes.fp32)
+    ti = torch.empty(M, MOE_TOPK, dtype=torch.int32)
+    biased_grouped_topk(
+        g,
+        b.to(g.dtype),
+        tw,
+        ti,
+        num_expert_group=1,
+        topk_group=1,
+        need_renorm=True,
+        routed_scaling_factor=1.0,
+    )
+    if n_shared:
+        ti = torch.cat([ti, torch.full((M, 1), MOE_E, dtype=torch.int32)], 1)
+        tw = torch.cat([tw, torch.ones(M, 1, dtype=dtypes.fp32)], 1)
+    return fused_moe_(
+        h,
+        w1,
+        w2,
+        tw,
+        ti,
+        activation=ActivationType.Silu.value,
+        quant_type=QuantType.per_Token.value,
+        w1_scale=w1s,
+        w2_scale=w2s,
+    )
+
+
+def _moe_router(h, g, b, w1, w2, w1s, w2s, n_shared=0):
+    from aiter import ActivationType
+    from aiter.fused_moe import fused_moe_router, fused_moe_router_supported
+
+    kw = dict(
+        activation=ActivationType.Silu.value,
+        quant_type=QuantType.per_Token.value,
+        num_fused_shared_experts=n_shared,
+    )
+    assert fused_moe_router_supported(h, w1, w2, MOE_TOPK, **kw)
+    return fused_moe_router(
+        h, g, b, w1, w2, MOE_TOPK, w1_scale=w1s, w2_scale=w2s, **kw
+    )
+
+
+def _moe_is_1stage(M):
+    import aiter.fused_moe as fm
+    from aiter import ActivationType
+
+    return fm.get_2stage_cfgs(
+        fm.get_padded_M(M), MOE_DIM, MOE_INTER, MOE_E, MOE_TOPK, dtypes.bf16,
+        dtypes.fp8, dtypes.fp8, QuantType.per_Token, True, ActivationType.Silu,
+        False, 0, 0, True, "separated", is_ep=False,
+    ).run_1stage
+
+
+def _assert_near_stock(out, h, g, b, W, ctx):
+    ref0, ref1 = _moe_stock(h, g, b, *W), _moe_stock(h, g, b, *W)
+    noise = (ref0.float() - ref1.float()).abs().max().item()
+    scale = ref0.float().abs().max().item()
+    diff = (out.float() - ref0.float()).abs().max().item()
+    assert torch.isfinite(out).all(), f"{ctx}: non-finite output"
+    assert scale > 0, f"{ctx}: stock output is all zero"
+    assert diff <= max(2 * noise, 1e-2 * scale), (
+        f"{ctx}: |router - stock| = {diff}, stock-vs-stock {noise}, |max| {scale}"
+    )
+
+
+@pytest.mark.parametrize("M", [1, 16, 17, 32, 64, 104, 128])
+def test_fp8_moe_matches_stock(M):
+    W = _fp8_moe_weights()
+    h, g, b = _moe_inputs(M, M)
+    _assert_near_stock(
+        _moe_router(h, g, b, *W), h, g, b, W, f"M={M} 1stage={_moe_is_1stage(M)}"
+    )
+
+
+# Padded CUDA-graph tokens are all-zero rows: scale 0 and fp8 bytes 0xfe
+# (see test_fp8_edge_rows). Their MoE output must be exactly zero, not NaN.
+@pytest.mark.parametrize("M", [8, 64])
+def test_fp8_moe_zero_rows(M):
+    W = _fp8_moe_weights()
+    zero = (0, M // 2, M - 1)
+    h, g, b = _moe_inputs(M, 7, zero)
+    h[0] = -0.0
+    out = _moe_router(h, g, b, *W)
+    assert out[list(zero)].count_nonzero() == 0, f"M={M}: zero rows not zero"
+    _assert_near_stock(out, h, g, b, W, f"M={M} with zero rows")
+
+
+class _FmoeSpy:
+    """Stand-in for aiter.fmoe_g1u1, which fused_moe_1stage looks up per call."""
+
+    NAMES = ("moe_buf", "a1", "w1", "w2", "sorted_ids", "sorted_weights",
+             "sorted_expert_ids", "num_valid_ids", "topk", "a1_scale",
+             "w1_scale", "w2_scale", "kernelName")
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args, **kw):
+        rec = dict(zip(self.NAMES, args), **kw)
+        self.calls.append(
+            {k: v.clone() if torch.is_tensor(v) else v for k, v in rec.items()}
+        )
+
+
+def _block_rows(rec, i, bm):
+    """(sorted_id, weight) pairs of one sorted block, ordered by id."""
+    ids = rec["sorted_ids"][i : i + bm].tolist()
+    return sorted(zip(ids, rec["sorted_weights"][i : i + bm].tolist()))
+
+
+def _fmoe_input_errs(r, s, bm):
+    buffers = ("sorted_ids", "sorted_weights", "sorted_expert_ids", "moe_buf")
+    errs = [
+        f"{k}: {tuple(r[k].shape)} {r[k].dtype} vs {tuple(s[k].shape)} {s[k].dtype}"
+        for k in (*buffers, "a1", "a1_scale")
+        if r[k].shape != s[k].shape or r[k].dtype != s[k].dtype
+    ]
+    errs += [
+        f"{k}: {r[k]!r} vs {s[k]!r}" for k in ("topk", "kernelName") if r[k] != s[k]
+    ]
+    if errs:
+        return errs
+    if not torch.equal(r["num_valid_ids"], s["num_valid_ids"]):
+        return [f"num_valid_ids {r['num_valid_ids']} vs {s['num_valid_ids']}"]
+    nv = int(s["num_valid_ids"][0])
+    blocks = nv // bm
+    r_eids, s_eids = r["sorted_expert_ids"][:blocks], s["sorted_expert_ids"][:blocks]
+    if not torch.equal(r_eids, s_eids):
+        errs.append("sorted_expert_ids")
+    for i in range(0, nv, bm):
+        rb, sb = _block_rows(r, i, bm), _block_rows(s, i, bm)
+        if [x for x, _ in rb] != [x for x, _ in sb] or any(
+            abs(x - y) > W_TOL for (_, x), (_, y) in zip(rb, sb)
+        ):
+            errs.append(f"sorted rows of block {i // bm}")
+            break
+    for k, view in (("a1", torch.uint8), ("a1_scale", torch.int32)):
+        if not torch.equal(r[k].view(view), s[k].view(view)):
+            errs.append(f"{k} bits")
+    errs += [
+        f"{n} moe_buf not zeroed"
+        for n, x in (("router", r), ("stock", s))
+        if x["moe_buf"].count_nonzero()
+    ]
+    return errs
+
+
+# fmoe_g1u1 picks its asm kernel from sorted_expert_ids.size(0), so the router's
+# sorted buffers must be sized exactly as moe_sorting sizes them, shared slot
+# included. The kernel is stubbed, so the weights are never read.
+@pytest.mark.parametrize("n_shared", [0, 1])
+@pytest.mark.parametrize("M", [17, 64, 128])
+def test_fp8_1stage_fmoe_inputs(M, n_shared, monkeypatch):
+    from aiter.fused_moe import BLOCK_SIZE_M
+
+    assert _moe_is_1stage(M)
+    E = MOE_E + n_shared
+    w1 = torch.empty(E, 2 * MOE_INTER, MOE_DIM, dtype=dtypes.fp8)
+    w2 = torch.empty(E, MOE_DIM, MOE_INTER, dtype=dtypes.fp8)
+    w1.is_shuffled = w2.is_shuffled = True
+    w1s = torch.ones(E, 2 * MOE_INTER, 1, dtype=dtypes.fp32)
+    w2s = torch.ones(E, MOE_DIM, 1, dtype=dtypes.fp32)
+    W = (w1, w2, w1s, w2s)
+    h, g, b = _moe_inputs(M, M)
+    spies = {}
+    for side, run in (("router", _moe_router), ("stock", _moe_stock)):
+        spies[side] = _FmoeSpy()
+        monkeypatch.setattr(aiter, "fmoe_g1u1", spies[side])
+        run(h, g, b, *W, n_shared=n_shared)
+    torch.cuda.synchronize()
+    assert len(spies["router"].calls) == 1 and len(spies["stock"].calls) == 1
+    r, s = spies["router"].calls[0], spies["stock"].calls[0]
+    errs = _fmoe_input_errs(r, s, BLOCK_SIZE_M)
+    assert not errs, f"M={M} n_shared={n_shared}: {errs}"
+
+
+# The tuned config can move the 1-stage/2-stage switch; the router must follow
+# whatever get_2stage_cfgs picks. Remap the lookup key so M=8 gets M=32's
+# 1-stage config and M=64 gets M=16's 2-stage one, on both paths.
+@pytest.mark.parametrize("M,want_1stage", [(8, True), (64, False)])
+def test_fp8_moe_forced_path(M, want_1stage, monkeypatch):
+    import aiter.fused_moe as fm
+
+    real, remap = fm.get_2stage_cfgs, {8: 32, 64: 16}
+    monkeypatch.setattr(
+        fm, "get_2stage_cfgs", lambda t, *a, **k: real(remap.get(t, t), *a, **k)
+    )
+    assert _moe_is_1stage(M) == want_1stage
+    W = _fp8_moe_weights()
+    h, g, b = _moe_inputs(M, 50 + M)
+    spy = _FmoeSpy()
+    real_fmoe = aiter.fmoe_g1u1
+
+    def count(*a, **k):
+        spy(*a, **k)
+        return real_fmoe(*a, **k)
+
+    monkeypatch.setattr(aiter, "fmoe_g1u1", count)
+    out = _moe_router(h, g, b, *W)
+    torch.cuda.synchronize()
+    assert len(spy.calls) == int(want_1stage)
+    monkeypatch.setattr(aiter, "fmoe_g1u1", real_fmoe)
+    _assert_near_stock(out, h, g, b, W, f"M={M} forced 1stage={want_1stage}")
+
+
+@pytest.mark.parametrize("M", [1, 32, 128])
+def test_fp8_moe_graph_replay(M):
+    W = _fp8_moe_weights()
+    hs, gs, bs = _moe_inputs(M, 200 + M)
+    call = lambda: _moe_router(hs, gs, bs, *W)
+    warm = torch.cuda.Stream()
+    warm.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warm):
+        call()
+    torch.cuda.current_stream().wait_stream(warm)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = call()
+    for seed in (1, 2, 1):
+        h, g, b = _moe_inputs(M, 300 + seed)
+        hs.copy_(h), gs.copy_(g), bs.copy_(b)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_near_stock(out.clone(), h, g, b, W, f"M={M} replay seed {seed}")
 
 
 if __name__ == "__main__":
