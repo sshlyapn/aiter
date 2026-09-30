@@ -46,7 +46,10 @@ void fused_moe_router_impl(
     torch::Tensor& topk_ids, torch::Tensor& topk_weights,
     torch::Tensor& sorted_ids, torch::Tensor& sorted_weights,
     torch::Tensor& sorted_expert_ids, torch::Tensor& num_valid_ids,
-    torch::Tensor& out_fp4, torch::Tensor& out_scale,
+    // Quantized activations and their scales; layout depends on quant_type:
+    //   per_1x32 (MXFP4):  out_q [M, cols/2] fp4x2, out_scale swizzled e8m0
+    //   per_Token (FP8):   out_q [M, cols] fp8 e4m3, out_scale [M, 1] fp32
+    torch::Tensor& out_q, torch::Tensor& out_scale,
     int64_t num_experts, int64_t topk, int64_t unit_size, int64_t group_size,
     bool need_renorm, double routed_scaling_factor,
     // Caller-owned scratch, >= fused_moe_router_workspace_size(M) bytes, with
@@ -67,7 +70,9 @@ void fused_moe_router_impl(
     int64_t num_fused_shared_experts,
     double  shared_expert_weight,
     int64_t ep_rank,
-    int64_t ep_size)
+    int64_t ep_size,
+    // QuantType of the activation quant; with out_q's dtype it picks the mode.
+    int64_t quant_type)
 {
     using namespace aiter::fmr;
     opus::bf16_t* moe_buf_ptr = nullptr;
@@ -122,20 +127,57 @@ void fused_moe_router_impl(
     TORCH_CHECK(E <= 2 * BlockSize,
                 "fused_moe_router_impl: num_experts must be <= ", 2 * BlockSize,
                 ", got ", E);
-    // A partial group would make the abs-max reduction span the wrong lanes.
-    TORCH_CHECK(group_size % TD == 0,
-                "fused_moe_router_impl: group_size must be a multiple of ", TD,
-                ", got ", group_size);
-    // The phase-3 scatter's hoisted swizzle table is only complete on an aligned
-    // column span; a partial span leaves trailing scale columns holding stale
-    // allocator memory that is read back as e8m0 exponents. Implied by
-    // cols == BlockSize * TD for either TD, checked so the coupling cannot be
-    // lost silently.
-    TORCH_CHECK((cols + group_size - 1) / group_size % aiter::fmr::kScalesPerThread == 0,
-                "fused_moe_router_impl: scales per row (ceil(cols/group_size)) must be a "
-                "multiple of ", aiter::fmr::kScalesPerThread, ", got ",
-                (cols + group_size - 1) / group_size, " for cols=", cols,
-                " group_size=", group_size);
+
+    // The quant mode is the (quant_type, out_q dtype) pair: per_1x32 alone
+    // would be ambiguous once MXFP8 exists.
+    const QuantType qt = static_cast<QuantType>(quant_type);
+    // The kernel divides by group_size in both modes, even where FP8 ignores it.
+    TORCH_CHECK(group_size > 0,
+                "fused_moe_router_impl: group_size must be positive, got ", group_size);
+    if(qt == QuantType::per_Token)
+    {
+        // opus::fp8_t is OCP e4m3 on gfx950, the only arch the router supports.
+        TORCH_CHECK(out_q.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                    "fused_moe_router_impl: quant_type per_Token needs a float8_e4m3fn "
+                    "out_q, got ", out_q.scalar_type());
+        TORCH_CHECK(out_scale.scalar_type() == at::kFloat,
+                    "fused_moe_router_impl: quant_type per_Token needs an fp32 out_scale, got ",
+                    out_scale.scalar_type());
+        TORCH_CHECK(out_q.numel() >= (int64_t)M * cols,
+                    "fused_moe_router_impl: out_q has ", out_q.numel(),
+                    " elements, need M * cols = ", (int64_t)M * cols);
+        TORCH_CHECK(out_scale.numel() >= M,
+                    "fused_moe_router_impl: out_scale has ", out_scale.numel(),
+                    " elements, need one per token (", M, ")");
+    }
+    else if(qt == QuantType::per_1x32)
+    {
+        TORCH_CHECK(out_q.scalar_type() == at::ScalarType::Float4_e2m1fn_x2 ||
+                        out_q.scalar_type() == at::kByte,
+                    "fused_moe_router_impl: quant_type per_1x32 needs an fp4x2 out_q, got ",
+                    out_q.scalar_type());
+        // A partial group would make the abs-max reduction span the wrong lanes.
+        TORCH_CHECK(group_size % TD == 0,
+                    "fused_moe_router_impl: group_size must be a multiple of ", TD,
+                    ", got ", group_size);
+        // The phase-3 scatter's hoisted swizzle table is only complete on an aligned
+        // column span; a partial span leaves trailing scale columns holding stale
+        // allocator memory that is read back as e8m0 exponents. Implied by
+        // cols == BlockSize * TD for either TD, checked so the coupling cannot be
+        // lost silently.
+        TORCH_CHECK((cols + group_size - 1) / group_size % aiter::fmr::kScalesPerThread == 0,
+                    "fused_moe_router_impl: scales per row (ceil(cols/group_size)) must be a "
+                    "multiple of ", aiter::fmr::kScalesPerThread, ", got ",
+                    (cols + group_size - 1) / group_size, " for cols=", cols,
+                    " group_size=", group_size);
+    }
+    else
+    {
+        TORCH_CHECK(false,
+                    "fused_moe_router_impl: quant_type must be per_1x32 (",
+                    static_cast<int64_t>(QuantType::per_1x32), ", MXFP4) or per_Token (",
+                    static_cast<int64_t>(QuantType::per_Token), ", FP8), got ", quant_type);
+    }
     // The kernel shifts instead of dividing by unit_size. Every AITER
     // block_size is a power of two, so check rather than carry a fallback.
     TORCH_CHECK(unit_size > 0 && (unit_size & (unit_size - 1)) == 0,
@@ -238,7 +280,7 @@ void fused_moe_router_impl(
     check_bf16(hidden, "hidden");
     // The rest are reached through data_ptr<T>, which checks the dtype but not
     // the layout, or are cast to a byte type where only the layout matters.
-    for(const auto& p : {std::make_pair(&out_fp4, "out_fp4"),
+    for(const auto& p : {std::make_pair(&out_q, "out_q"),
                          std::make_pair(&out_scale, "out_scale"),
                          std::make_pair(&bias, "bias"),
                          std::make_pair(&topk_ids, "topk_ids"),
@@ -272,14 +314,17 @@ void fused_moe_router_impl(
                 "bfloat16, got ", bias.scalar_type());
     const bool bias_is_f32 = bias.scalar_type() == at::kFloat;
 
-    // One body, instantiated per (bias dtype, shared-expert count).
-    auto launch_all = [&](auto bias_tag, auto nshared_tag, auto td_tag) {
+    // One body, instantiated per (bias dtype, shared-expert count, TD, quant mode).
+    auto launch_all = [&](auto bias_tag, auto nshared_tag, auto td_tag, auto qt_tag,
+                          auto out_tag) {
         using DB                = decltype(bias_tag);
         constexpr int NSHARED   = decltype(nshared_tag)::value;
         constexpr int TDV       = decltype(td_tag)::value;
+        constexpr QuantType QTV = decltype(qt_tag)::value;
+        using DO                = typename decltype(out_tag)::type;
         const DB* b = reinterpret_cast<const DB*>(bias.data_ptr());
         auto* kern = aiter::fmr::fused_moe_routing_kernel<
-            BlockSize, TDV, opus::bf16_t, aiter::fmr::kFused, DB, NSHARED>;
+            BlockSize, TDV, opus::bf16_t, aiter::fmr::kFused, DB, NSHARED, QTV, DO>;
         (void)hipFuncSetAttribute(reinterpret_cast<const void*>(kern),
                                   hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
         // The grid barrier deadlocks unless every block is co-resident.
@@ -313,9 +358,9 @@ void fused_moe_router_impl(
         if(split)
         {
             auto* k1 = aiter::fmr::fused_moe_routing_kernel<
-                BlockSize, TDV, opus::bf16_t, aiter::fmr::kPhase1, DB, NSHARED>;
+                BlockSize, TDV, opus::bf16_t, aiter::fmr::kPhase1, DB, NSHARED, QTV, DO>;
             auto* k23 = aiter::fmr::fused_moe_routing_kernel<
-                BlockSize, TDV, opus::bf16_t, aiter::fmr::kPhase23, DB, NSHARED>;
+                BlockSize, TDV, opus::bf16_t, aiter::fmr::kPhase23, DB, NSHARED, QTV, DO>;
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k1),
                                       hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k23),
@@ -326,8 +371,7 @@ void fused_moe_router_impl(
     g, b, h, topk_weights.data_ptr<float>(), topk_ids.data_ptr<int>(),                       \
         sorted_ids.data_ptr<int>(), sorted_weights.data_ptr<float>(),                        \
         sorted_expert_ids.data_ptr<int>(), num_valid_ids.data_ptr<int>(),                    \
-        reinterpret_cast<opus::fp4_t*>(out_fp4.data_ptr()),                                  \
-        reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                                    \
+        reinterpret_cast<DO*>(out_q.data_ptr()), out_scale.data_ptr(),                       \
         ws_tok_scale, moe_buf_ptr, moe_buf_elems, ws_sem, mask_ptr, M, E, topk,              \
         unit_size, group_size, cols, max_blocks, max_tokens, need_renorm,                    \
         (float)routed_scaling_factor, (float)shared_expert_weight, (int)ep_rank,             \
@@ -344,8 +388,7 @@ void fused_moe_router_impl(
             g, b, h, topk_weights.data_ptr<float>(), topk_ids.data_ptr<int>(),
             sorted_ids.data_ptr<int>(), sorted_weights.data_ptr<float>(),
             sorted_expert_ids.data_ptr<int>(), num_valid_ids.data_ptr<int>(),
-            reinterpret_cast<opus::fp4_t*>(out_fp4.data_ptr()),
-            reinterpret_cast<uint8_t*>(out_scale.data_ptr()),
+            reinterpret_cast<DO*>(out_q.data_ptr()), out_scale.data_ptr(),
             ws_tok_scale, moe_buf_ptr, moe_buf_elems, ws_sem, mask_ptr,
             M, E, topk, unit_size, group_size, cols, max_blocks, max_tokens, need_renorm,
             (float)routed_scaling_factor, (float)shared_expert_weight, (int)ep_rank,
@@ -358,24 +401,40 @@ void fused_moe_router_impl(
     // TD is a template argument, so the runtime value picks an instantiation.
     // TD == 16 must reach the same one as before 2048 was supported, keeping
     // the reference path's register count and codegen untouched.
-    auto dispatch_td = [&](auto bias_tag, auto nshared_tag) {
+    auto dispatch_td = [&](auto bias_tag, auto nshared_tag, auto qt_tag, auto out_tag) {
         if(TD == 16)
-            launch_all(bias_tag, nshared_tag, std::integral_constant<int, 16>{});
+            launch_all(bias_tag, nshared_tag, std::integral_constant<int, 16>{}, qt_tag, out_tag);
         else
-            launch_all(bias_tag, nshared_tag, std::integral_constant<int, 8>{});
+            launch_all(bias_tag, nshared_tag, std::integral_constant<int, 8>{}, qt_tag, out_tag);
     };
 
-    auto dispatch_shared = [&](auto bias_tag) {
+    auto dispatch_shared = [&](auto bias_tag, auto qt_tag, auto out_tag) {
         if(n_shared == 0)
-            dispatch_td(bias_tag, std::integral_constant<int, 0>{});
+            dispatch_td(bias_tag, std::integral_constant<int, 0>{}, qt_tag, out_tag);
         else
-            dispatch_td(bias_tag, std::integral_constant<int, 1>{});
+            dispatch_td(bias_tag, std::integral_constant<int, 1>{}, qt_tag, out_tag);
+    };
+
+    // MXFP4 passes its (QuantType, out type) explicitly, which names the same
+    // instantiation as the kernel's defaults. FP8 has no shared-expert fusion
+    // (checked above), so only NSHARED == 0 is instantiated for it.
+    auto dispatch_quant = [&](auto bias_tag) {
+        if(qt == QuantType::per_Token)
+            dispatch_shared(bias_tag,
+                            std::integral_constant<QuantType, QuantType::per_Token>{},
+                            aiter::fmr::type_tag<opus::fp8_t>{});
+        else if(qt == QuantType::per_1x32)
+            dispatch_shared(bias_tag,
+                            std::integral_constant<QuantType, QuantType::per_1x32>{},
+                            aiter::fmr::type_tag<opus::fp4_t>{});
+        else
+            TORCH_CHECK(false, "fused_moe_router_impl: no kernel for quant_type ", quant_type);
     };
 
     if(bias_is_f32)
-        dispatch_shared(float{});
+        dispatch_quant(float{});
     else
-        dispatch_shared(opus::bf16_t{});
+        dispatch_quant(opus::bf16_t{});
 }
 
 #include "rocm_ops.hpp"
@@ -396,7 +455,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("num_fused_shared_experts") = 0,
           py::arg("shared_expert_weight") = 1.0,
           py::arg("ep_rank") = 0,
-          py::arg("ep_size") = 1);
+          py::arg("ep_size") = 1,
+          py::arg("quant_type") = static_cast<int64_t>(QuantType::per_1x32));
     m.def("fused_moe_router_workspace_size", &fused_moe_router_workspace_size,
           "workspace bytes for up to max_tokens tokens", py::arg("max_tokens"));
 }

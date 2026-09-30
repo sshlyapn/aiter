@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Fused MoE routing preamble (topk + sort + MXFP4 quant) op bindings.
+# Fused MoE routing preamble (topk + sort + MXFP4 / FP8 per-token quant) op bindings.
 import functools
 
 import torch
 
 from ..jit.core import compile_ops
+from .enum import QuantType
 
 MD_NAME = "module_fused_moe_router"
 
@@ -43,12 +44,15 @@ def fused_moe_router_impl(
     shared_expert_weight: float = 1.0,
     ep_rank: int = 0,
     ep_size: int = 1,
+    quant_type: int = QuantType.per_1x32.value,
 ) -> None:
     """Single-barrier fused routing preamble: biased grouped topk + moe_sort +
-    MXFP4 activation quant, in one (or, above M~104, two) launches.
+    activation quant (MXFP4 or FP8 per-token), in one (or, above M~104, two)
+    launches.
 
-    Replaces the 4-kernel sequence ``biased_grouped_topk`` -> ``moe_sorting``
-    -> ``fused_dynamic_mxfp4_quant_moe_sort``. All outputs are written in
+    Replaces ``biased_grouped_topk`` -> ``moe_sorting`` -> the activation
+    quant: ``fused_dynamic_mxfp4_quant_moe_sort`` for MXFP4, or
+    ``per_token_quant_hip`` for FP8 per-token. All outputs are written in
     place and must be preallocated with exactly the shapes the stock path
     produces.
 
@@ -68,13 +72,17 @@ def fused_moe_router_impl(
         sorted_weights: ``[max_num_tokens_padded]`` fp32 output.
         sorted_expert_ids: ``[max_num_m_blocks]`` int32 output.
         num_valid_ids: ``[2]`` int32 output.
-        out_fp4: ``[M, cols // 2]`` fp4x2 quantized activation output.
-        out_scale: ``[pad32(max_num_tokens_padded), pad8(cols // group_size)]``
-            e8m0 output, swizzled to the GEMM tile layout.
+        out_fp4: quantized activation output (``out_q``; the name is kept
+            for keyword callers). ``per_1x32``: ``[M, cols // 2]`` fp4x2.
+            ``per_Token``: ``[M, cols]`` float8_e4m3fn, one row per token.
+        out_scale: ``per_1x32``: ``[pad32(max_num_tokens_padded),
+            pad8(cols // group_size)]`` e8m0, swizzled to the GEMM tile
+            layout. ``per_Token``: ``[M, 1]`` fp32, indexed by token.
         num_experts: global expert count (mask length under EP).
         topk: experts per token.
         unit_size: sort block size (``block_size_M``).
-        group_size: MX scale group, 32.
+        group_size: MX scale group, 32. Pass 32 in every mode: FP8 per-token
+            ignores it, but the entry still requires a positive value.
         need_renorm: renormalize the topk weights.
         routed_scaling_factor: post-renorm weight scale.
         workspace: uint8 scratch of at least
@@ -95,6 +103,10 @@ def fused_moe_router_impl(
             over ``ep_size`` and non-owners park the shared row on an
             always-masked sentinel. 1 (the default) makes every rank an owner,
             which is the non-EP case.
+        quant_type: ``QuantType`` value of the activation quant.
+            ``per_1x32`` (default) is MXFP4; ``per_Token`` is FP8 per-token.
+            A fused shared expert shares the routed experts' activation quant,
+            so its weights must carry the same quant spec.
     """
 
 

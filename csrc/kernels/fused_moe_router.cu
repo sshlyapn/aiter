@@ -7,12 +7,16 @@
 //
 // Phase 1 -- block owns tokens t = bid, bid+GRID, ..; no cross-block deps
 //   wave 0 : biased-sigmoid top-k -> topk_ids/topk_weights
-//   all    : MXFP4 quant of hidden[t] -> out[t], group e8m0 -> tok_scale[t]
+//   all    : quant of hidden[t] -> out[t]
+//            MXFP4:         group e8m0 -> tok_scale[t]
+//            FP8 per-token: fp32 row scale -> out_scale[t] (final layout)
 // ---- grid barrier (the only one) ----
 // Phase 2 : reload topk into LDS, histogram + scan -> per-expert base offsets
 // Phase 3 : each block takes a unit-aligned slice of the sorted output and per
 //           expert ballot-ranks its routed ids -> sorted_ids/weights/expert_ids,
-//           pads rows, scatters the token's e8m0 scales into swizzled layout.
+//           pads rows; MXFP4 also scatters the token's e8m0 scales into the
+//           swizzled layout. The FP8 per-token GEMMs gather the scale by token
+//           id themselves, so that mode has no scatter.
 //
 // Phase 2 runs redundantly in every block on purpose: a few hundred LDS
 // elements is cheaper than a second grid barrier.
@@ -21,6 +25,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include "opus/opus.hpp"
+#include "aiter_enum.h" // QuantType
 #include "warp_sort.h" // aiter::mov_dpp_
 #include "quant_kernels.cu" // device helpers: scaled_quant_vgpr_impl, load_vector_nbytes,
                             // multithread_reduce, fp4_f32_to_e8m0_scale, mx_scale_shuffle_idx
@@ -29,6 +34,27 @@ namespace aiter {
 namespace fmr {
 
 static constexpr int kWaveSize = 64;
+
+// Activation quant modes, keyed by (QuantType, output element type): per_1x32
+// alone is ambiguous between MXFP4 and MXFP8. Any other pair fails to compile.
+template <QuantType QT, typename DTYPE_O>
+inline constexpr bool fmr_quant_supported =
+    (QT == QuantType::per_1x32 && std::is_same_v<DTYPE_O, opus::fp4_t>) ||
+    (QT == QuantType::per_Token && std::is_same_v<DTYPE_O, opus::fp8_t>);
+
+// Dependent false for the terminal branch of a quant-mode if-constexpr chain,
+// so a mode added to fmr_quant_supported fails to compile until every chain
+// handles it.
+template <QuantType QT, typename DTYPE_O>
+inline constexpr bool fmr_unhandled_quant = false;
+
+// Host dispatch tag for DTYPE_O: opus's narrow types are not all usable as
+// value tags.
+template <typename T>
+struct type_tag
+{
+    using type = T;
+};
 
 // Scales per thread in the phase-3 scatter, and the alignment the scale row
 // must satisfy: mx_scale_shuffle_idx's y terms are periodic in this, so it is
@@ -330,13 +356,22 @@ __device__ __forceinline__ void phase1_topk_select(const DTYPE_I* __restrict__ g
     }
 }
 
-// MXFP4 quant of one token's hidden row, by the whole block. cols/TD ==
-// BlockSize, so one vector per thread covers the row in a single pass. The e8m0
-// byte goes to a scratch row, not the swizzled buffer: its swizzled position
-// depends on the sorted row, which is unknown until after the barrier.
-template <int BlockSize, int TD, typename DTYPE_I>
-__device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out,
-                                                   uint8_t* __restrict__ tok_scale,
+// Quant of one token's hidden row, by the whole block. cols/TD == BlockSize, so
+// one vector per thread covers the row in a single pass.
+//
+// MXFP4: scale_dst is the tok_scale scratch row, not the swizzled buffer: an
+// e8m0 byte's swizzled position depends on the sorted row, which is unknown
+// until after the barrier.
+//
+// FP8 per-token: scale_dst is the final [M, 1] fp32 scale, indexed by token.
+// The math is dynamic_per_token_scaled_quant_kernel's, expression for
+// expression (0.f start, block_reduce max, the same scaled_quant_vgpr_impl
+// instantiation on the bf16 vector), so bytes and scale match it exactly.
+// block_reduce synchronizes the block, so every thread must reach this call.
+template <int BlockSize, int TD, typename DTYPE_I, QuantType QT, typename DTYPE_O,
+          typename DTYPE_S>
+__device__ __forceinline__ void phase1_quant_token(DTYPE_O* __restrict__ out,
+                                                   DTYPE_S* __restrict__ scale_dst,
                                                    const DTYPE_I* __restrict__ input,
                                                    int token, int cols, int group_size,
                                                    int scaleN_pad)
@@ -353,26 +388,50 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
     vec_i vin =
         load_vector_nbytes<DTYPE_I, TD, (sizeof(DTYPE_I) * TD % 16 == 0 ? 16 : 8), /*aux=*/0>(
             buffer_input, threadIdx.x * TD);
-    vec_f  vin_f32;
-    float* vin_f32_ptr = reinterpret_cast<float*>(&vin_f32);
-    float  absMax      = 1e-10f;
-#pragma unroll
-    for(int j = 0; j < TD; ++j)
+
+    if constexpr(QT == QuantType::per_Token && std::is_same_v<DTYPE_O, opus::fp8_t>)
     {
-        vin_f32[j] = bf16f(vin[j]);
-        absMax     = max(absMax, fabsf(vin_f32[j]));
+        const float inverted_DTYPE_MAX =
+            (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        float absMax = 0.f;
+#pragma unroll
+        for(int j = 0; j < TD; ++j)
+            absMax = max(absMax, abs(static_cast<float>(vin[j])));
+        absMax          = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
+        float row_scale = absMax * inverted_DTYPE_MAX;
+        if(threadIdx.x == 0)
+            scale_dst[token] = row_scale;
+        scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, TD>(out, reinterpret_cast<DTYPE_I*>(&vin),
+                                                     &row_scale, cols, (int64_t)token * cols);
     }
-    // aiter::Max() postdates this base; absMax is float, so fmaxf is equivalent.
-    auto max_op     = [](float a, float b) { return fmaxf(a, b); };
-    absMax          = multithread_reduce(absMax, max_op, num_thread_per_group);
-    float row_scale = aiter::fp4_f32_to_e8m0_scale(absMax);
+    else if constexpr(QT == QuantType::per_1x32 && std::is_same_v<DTYPE_O, opus::fp4_t>)
+    {
+        vec_f  vin_f32;
+        float* vin_f32_ptr = reinterpret_cast<float*>(&vin_f32);
+        float  absMax      = 1e-10f;
+#pragma unroll
+        for(int j = 0; j < TD; ++j)
+        {
+            vin_f32[j] = bf16f(vin[j]);
+            absMax     = max(absMax, fabsf(vin_f32[j]));
+        }
+        // aiter::Max() postdates this base; absMax is float, so fmaxf is equivalent.
+        auto max_op     = [](float a, float b) { return fmaxf(a, b); };
+        absMax          = multithread_reduce(absMax, max_op, num_thread_per_group);
+        float row_scale = aiter::fp4_f32_to_e8m0_scale(absMax);
 
-    if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
-        tok_scale[(int64_t)token * scaleN_pad + scale_k] =
-            (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
+        if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
+            scale_dst[(int64_t)token * scaleN_pad + scale_k] =
+                (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
 
-    scaled_quant_vgpr_impl<float, opus::fp4_t, TD>(out, vin_f32_ptr, &row_scale, cols,
-                                                   (int64_t)token * cols);
+        scaled_quant_vgpr_impl<float, DTYPE_O, TD>(out, vin_f32_ptr, &row_scale, cols,
+                                                    (int64_t)token * cols);
+    }
+    else
+    {
+        static_assert(fmr_unhandled_quant<QT, DTYPE_O>,
+                      "phase1_quant_token: no quant path for this (QuantType, DTYPE_O)");
+    }
 }
 
 // One token of phase 1: load, quant, select (see phase1_topk_load for why that
@@ -391,9 +450,10 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
             CALL(8);                \
     } while(0)
 
-template <int BlockSize, int TD, int NSHARED, typename DTYPE_I, typename DTYPE_B>
+template <int BlockSize, int TD, int NSHARED, typename DTYPE_I, typename DTYPE_B, QuantType QT,
+          typename DTYPE_O, typename DTYPE_S>
 __device__ __forceinline__ void
-phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
+phase1_token(DTYPE_O* __restrict__ out, DTYPE_S* __restrict__ scale_dst,
              const DTYPE_I* __restrict__ hidden, const DTYPE_I* __restrict__ gating,
              const DTYPE_B* __restrict__ bias, float* __restrict__ topk_weights,
              int* __restrict__ topk_ids, int token, int E, int topk, int cols, int group_size,
@@ -412,8 +472,8 @@ phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
 #undef FMR_LOAD
     }
 
-    phase1_quant_token<BlockSize, TD, DTYPE_I>(out, tok_scale, hidden, token, cols, group_size,
-                                               scaleN_pad);
+    phase1_quant_token<BlockSize, TD, DTYPE_I, QT>(out, scale_dst, hidden, token, cols,
+                                                   group_size, scaleN_pad);
 
     if(sel)
     {
@@ -479,10 +539,14 @@ __device__ __forceinline__ void expert_rank_list(int* buf, const int* s_expert, 
 // PART selects which half a launch runs: kFused is both with the grid barrier
 // between, kPhase1/kPhase23 split at exactly that barrier into two launches.
 // The host picks by token count (kSplitMinTokens).
+//
+// (QT, DTYPE_O) is the activation quant mode, see fmr_quant_supported. The
+// defaults are MXFP4, so the pre-existing instantiations keep their codegen.
 enum FmrPart { kFused = 0, kPhase1 = 1, kPhase23 = 2 };
 
 template <int BlockSize, int TD, typename DTYPE_I, int PART = kFused,
-          typename DTYPE_B = DTYPE_I, int NSHARED = 0>
+          typename DTYPE_B = DTYPE_I, int NSHARED = 0, QuantType QT = QuantType::per_1x32,
+          typename DTYPE_O = opus::fp4_t>
 __global__ void __launch_bounds__(BlockSize)
 fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          const DTYPE_B* __restrict__ bias,     // [E] fp32 or bf16
@@ -493,9 +557,11 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          float* __restrict__ sorted_weights,   // [maxpad]
                          int* __restrict__ sorted_expert_ids,  // [maxblk]
                          int* __restrict__ num_valid_ids,      // [2]
-                         opus::fp4_t* __restrict__ out,        // [M, cols/2]
-                         uint8_t* __restrict__ out_scale,      // swizzled e8m0
-                         uint8_t* __restrict__ tok_scale,      // [M, scaleN_pad] scratch
+                         // MXFP4: [M, cols/2] fp4x2. FP8 per-token: [M, cols] fp8.
+                         DTYPE_O* __restrict__ out,
+                         // MXFP4: swizzled e8m0 (uint8_t). FP8 per-token: [M, 1] fp32.
+                         void* __restrict__ out_scale,
+                         uint8_t* __restrict__ tok_scale,      // [M, scaleN_pad] scratch, MXFP4 only
                          // stage2 accumulates into moe_buf atomically, so it must start
                          // zeroed; doing it here saves a separate fill launch. Never read
                          // here, so it needs no ordering. nullptr = already zeroed.
@@ -513,6 +579,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          // in the round-robin that keeps them un-duplicated.
                          float shared_w, int ep_rank, int ep_size)
 {
+    static_assert(fmr_quant_supported<QT, DTYPE_O>, "unsupported fused router quant mode");
     extern __shared__ char smem_raw[];
     // One row per pick plus one per fused shared expert.
     const int  topk_total        = topk + NSHARED;
@@ -570,12 +637,26 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
             moe_buf[i] = (DTYPE_I)0;
     }
 
+    // Where phase 1 writes a token's scale: MXFP4 stages e8m0 bytes in the
+    // tok_scale scratch for the phase-3 scatter; FP8 per-token writes its fp32
+    // scale straight to the final [M, 1] output.
+    auto* scale_dst = [&] {
+        if constexpr(QT == QuantType::per_Token)
+            return static_cast<float*>(out_scale);
+        else if constexpr(QT == QuantType::per_1x32)
+            return tok_scale;
+        else
+            static_assert(fmr_unhandled_quant<QT, DTYPE_O>,
+                          "fused_moe_routing_kernel: no phase-1 scale destination for this "
+                          "QuantType");
+    }();
+
     // Phase 1: per-token topk + quant.
     if constexpr(PART != kPhase23)
     for(int t = blockIdx.x; t < M; t += gridDim.x)
     {
-        phase1_token<BlockSize, TD, NSHARED, DTYPE_I, DTYPE_B>(
-            out, tok_scale, hidden, gating, bias, topk_weights, topk_ids, t, E, topk, cols,
+        phase1_token<BlockSize, TD, NSHARED, DTYPE_I, DTYPE_B, QT>(
+            out, scale_dst, hidden, gating, bias, topk_weights, topk_ids, t, E, topk, cols,
             group_size, scaleN_pad, need_renorm, rsf, shared_w, ep_rank, ep_size);
         __syncthreads(); // the aliased scratch is reused each iteration
     }
@@ -810,10 +891,13 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
             }
         }
 
+        // Scale scatter: MX modes only.
+        if constexpr(QT == QuantType::per_1x32)
         {
             // thread_data e8m0 bytes per thread, so `chunk` threads cover one
             // sorted row -- the shape the stock mxfp4_moe_sort_kernel uses, and
             // the one that keeps the writes coalesced through the swizzle.
+            uint8_t* out_scale_mx     = static_cast<uint8_t*>(out_scale);
             constexpr int thread_data = kScalesPerThread;
             const int     chunk       = scaleN_valid / thread_data;
             for(int idx = tid; idx < (row_end - row_begin) * chunk; idx += BlockSize)
@@ -840,8 +924,19 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                 constexpr int OFF[thread_data] = {0, 64, 128, 192, 2, 66, 130, 194};
 #pragma unroll
                 for(int j = 0; j < thread_data; ++j)
-                    out_scale[sbase + OFF[j]] = src ? src[j] : (uint8_t)0;
+                    out_scale_mx[sbase + OFF[j]] = src ? src[j] : (uint8_t)0;
             }
+        }
+        else if constexpr(QT == QuantType::per_Token)
+        {
+            // Nothing to scatter: phase 1 wrote the final token-indexed scale,
+            // and the per-token GEMMs gather it through sorted_ids.
+        }
+        else
+        {
+            static_assert(fmr_unhandled_quant<QT, DTYPE_O>,
+                          "fused_moe_routing_kernel: no phase-3 scale handling for this "
+                          "QuantType");
         }
         __syncthreads(); // s_buf is reused by the next expert in the slice
         row_begin = row_end;

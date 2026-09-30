@@ -608,6 +608,41 @@ def fused_moe_router_arch_supported() -> bool:
 # Solar-35B class.
 FUSED_MOE_ROUTER_HIDDEN_DIMS = (2048, 4096)
 
+# Stage-1 activation quant the router fuses, keyed by (quant_type, w1 dtype):
+# quant_type alone is ambiguous once MXFP8 (per_1x32 with fp8 weights) exists.
+_FUSED_ROUTER_QUANT = {
+    (QuantType.per_1x32, dtypes.fp4x2): dtypes.fp4x2,  # MXFP4
+    (QuantType.per_Token, dtypes.fp8): dtypes.fp8,  # FP8 per-token (PTPC)
+}
+
+
+def _fused_router_quant(quant_type, w1_dtype, q_dtype_a=None):
+    """``(QuantType, activation dtype)`` the router fuses for this config, or None.
+
+    ``q_dtype_a``, when given, is the activation dtype the GEMMs expect and
+    must be the one the router emits.
+    """
+    qt = QuantType(quant_type)
+    out_dtype = _FUSED_ROUTER_QUANT.get((qt, w1_dtype))
+    if out_dtype is None or q_dtype_a not in (None, out_dtype):
+        return None
+    return qt, out_dtype
+
+
+def _fused_router_1stage_ok(metadata, isG1U1: bool) -> bool:
+    """Whether a 1-stage config lands on ``fused_moe_1stage``'s ``fmoe_g1u1``
+    branch, the only one that takes the router's pre-quantized per-token FP8
+    input as-is. ``doweight_stage1`` (the ``tkw1`` branch, which re-quantizes)
+    is refused separately by the callers.
+    """
+    stage1 = metadata.stage1
+    return (
+        isG1U1
+        and not metadata.flat
+        and getattr(stage1, "func", None) is fused_moe_1stage
+        and not getattr(stage1, "keywords", {}).get("xbf16", False)
+    )
+
 
 def fused_moe_router_config_supported(
     hidden_dim: int,
@@ -626,10 +661,9 @@ def fused_moe_router_config_supported(
     """
     return (
         fused_moe_router_arch_supported()
-        and QuantType(quant_type) == QuantType.per_1x32
+        and _fused_router_quant(quant_type, w1_dtype) is not None
         and ActivationType(activation) == ActivationType.Silu
         and GateMode(gate_mode) == GateMode.SEPARATED
-        and w1_dtype == dtypes.fp4x2
         and hidden_dtype == dtypes.bf16
         and hidden_dim in FUSED_MOE_ROUTER_HIDDEN_DIMS
         # Phase 1 places the shared rows on the lanes just past topk, within the
@@ -710,14 +744,15 @@ def fused_moe_router_supported(
     ):
         return False
 
-    # The tuned config picks 1-stage or FLAT for some shapes, and the fused
-    # router only implements the 2-stage non-FLAT path. Derived exactly as
+    # The tuned config picks 1-stage or FLAT for some shapes. FLAT is never
+    # fused; 1-stage only for FP8 per-token into fmoe_g1u1. Derived exactly as
     # `fused_moe_router` does, so `get_2stage_cfgs` is an lru_cache hit there.
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
     gate_mode = GateMode(gate_mode)
     M = hidden_states.shape[0]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    isG1U1 = inter_dim != w1.shape[1]
     dtype, quant_type, q_dtype_a, q_dtype_w = _resolve_quant_dtypes(
         M, hidden_states, w1, quant_type, activation, gate_mode, a1_scale, dtype
     )
@@ -735,7 +770,7 @@ def fused_moe_router_supported(
         q_dtype_a,
         q_dtype_w,
         quant_type,
-        inter_dim != w1.shape[1],
+        isG1U1,
         activation,
         doweight_stage1,
         hidden_pad,
@@ -744,7 +779,27 @@ def fused_moe_router_supported(
         gate_mode,
         is_ep=expert_mask is not None,
     )
-    return not metadata.run_1stage and not metadata.flat
+    if metadata.flat:
+        return False
+    if quant_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
+        # The router emits exactly what per_token_quant_hip would, which is
+        # what fused_moe_2stages feeds any stage1 and what fused_moe_1stage
+        # feeds fmoe_g1u1, so the 2-stage stage1 needs no check. A static
+        # a1_scale is refused on bf16 input by the stock path, and the router
+        # would silently replace it with a dynamic one.
+        return (
+            (not metadata.run_1stage or _fused_router_1stage_ok(metadata, isG1U1))
+            and q_dtype_a == dtypes.fp8
+            and a1_scale is None
+            and not doweight_stage1
+        )
+    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
+        return not metadata.run_1stage
+    else:
+        raise NotImplementedError(
+            f"fused_moe_router_supported: no gate for fused quant {quant_type} "
+            f"with {q_dtype_w} weights"
+        )
 
 
 def fused_moe_router(
@@ -781,13 +836,17 @@ def fused_moe_router(
     """MoE forward that routes internally, replacing the 4-kernel preamble.
 
     Same result as ``biased_grouped_topk`` -> ``fused_moe_``, but topk, the
-    sort and the MXFP4 activation quant run in one kernel
-    (``fused_moe_router_impl``). It takes ``gating_output`` instead of
-    ``topk_ids`` because the sorted buffers are sized from ``block_size_M``,
-    which comes from the tuned-config lookup here and is not known to callers.
+    sort and the stage-1 activation quant (MXFP4, or FP8 per-token) run in
+    one kernel (``fused_moe_router_impl``). It takes ``gating_output`` instead
+    of ``topk_ids`` because the sorted buffers are sized from
+    ``block_size_M``, which comes from the tuned-config lookup here and is not
+    known to callers.
 
-    Only the MXFP4 2-stage decode path is supported -- check
-    :func:`fused_moe_router_supported` first; anything else asserts.
+    Supported decode paths, never FLAT: MXFP4 (``per_1x32``, fp4x2 weights)
+    on 2-stage, and FP8 per-token (``per_Token``, fp8 weights with
+    per-channel scales and dynamic activation scales) on 2-stage and on the
+    1-stage ``fmoe_g1u1`` kernel -- check :func:`fused_moe_router_supported`
+    first; anything else asserts.
 
     Args:
         hidden_states: ``[M, model_dim]`` bf16 activations.
@@ -870,16 +929,37 @@ def fused_moe_router(
     block_size_M = int(metadata.block_m)
 
     # The fused kernel hardcodes what it fuses: biased sigmoid topk over a
-    # single expert group, and an MXFP4 stage1 quant. Every other path needs
-    # the unfused preamble, so refuse instead of producing wrong numbers.
-    assert not metadata.run_1stage and not metadata.flat, (
-        "fused_moe_router: only the 2-stage non-FLAT path is fused; "
+    # single expert group, and a stage1 quant from _FUSED_ROUTER_QUANT. Every
+    # other path needs the unfused preamble, so refuse instead of producing
+    # wrong numbers.
+    assert not metadata.flat, (
+        "fused_moe_router: the FLAT path is not fused; "
         "gate on fused_moe_router_supported and call fused_moe_ otherwise"
     )
-    assert q_dtype_a == dtypes.fp4x2 and quant_type == QuantType.per_1x32, (
-        f"fused_moe_router: fused quant is MXFP4 only, got {q_dtype_a=} "
-        f"{quant_type=}"
+    router_quant = _fused_router_quant(quant_type, w1.dtype, q_dtype_a)
+    assert router_quant is not None, (
+        f"fused_moe_router: no fused activation quant for {quant_type=}, "
+        f"w1 {w1.dtype}, {q_dtype_a=}"
     )
+    q_dtype_out = router_quant[1]
+    if quant_type == QuantType.per_Token and w1.dtype == dtypes.fp8:
+        # a1_prequant / the pre-quantized 1-stage input would override it; the
+        # stock path rejects it instead.
+        assert a1_scale is None, "fused_moe_router: a static a1_scale is not fused"
+        assert not metadata.run_1stage or _fused_router_1stage_ok(metadata, isG1U1), (
+            "fused_moe_router: FP8 1-stage is fused only into fmoe_g1u1 "
+            f"(G1U1, no xbf16), got {metadata.stage1}"
+        )
+    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.fp4x2:
+        assert not metadata.run_1stage, (
+            "fused_moe_router: MXFP4 is fused only on the 2-stage path; "
+            "gate on fused_moe_router_supported and call fused_moe_ otherwise"
+        )
+    else:
+        raise NotImplementedError(
+            f"fused_moe_router: no path check for fused quant {quant_type} "
+            f"with {w1.dtype} weights"
+        )
     assert (
         num_expert_group == 1 and topk_group == 1
     ), f"fused_moe_router: {num_expert_group=} {topk_group=}, only 1/1 is fused"
@@ -921,10 +1001,12 @@ def fused_moe_router(
         f"entries, need at least {global_E}"
     )
 
+    # MX scale group. Passed in every mode: the entry requires it positive even
+    # though FP8 per-token ignores it.
+    group_size = 32
     # Sorted-map buffers, sized exactly as _moe_sorting_impl does, but over the
     # full slot count: every emitted id (shared and sentinel included) gets its
     # own padded block in the sort.
-    group_size = 32
     max_num_tokens_padded = M * topk_total + E_tot * block_size_M - topk_total
     max_num_m_blocks = (max_num_tokens_padded + block_size_M - 1) // block_size_M
     topk_ids = torch.empty((M, topk_total), dtype=dtypes.i32, device=device)
@@ -935,22 +1017,36 @@ def fused_moe_router(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    # stage2 atomically accumulates into moe_buf, so it must start zeroed.
+    # stage2 (or fmoe_g1u1 on 1-stage) atomically accumulates into moe_buf,
+    # so it must start zeroed.
     # The fused routing kernel now does that clear itself (passed as moe_buf
     # below), which removes a separate ~4.6us torch FillFunctor launch per MoE
     # block -- the launch the fusion exists to avoid. empty() is therefore
     # correct here: the kernel writes every element before stage2 runs.
     moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
 
-    # Quantized stage1 input, sized as fused_dynamic_mx_quant_moe_sort does.
-    scaleN_pad = ((model_dim // group_size) + 7) // 8 * 8
-    a1 = torch.empty(M, model_dim // 2, dtype=dtypes.fp4x2, device=device)
-    a1_scale_sorted = torch.empty(
-        (max_num_tokens_padded + 31) // 32 * 32,
-        scaleN_pad,
-        dtype=dtypes.fp8_e8m0,
-        device=device,
-    )
+    # Quantized stage1 input and its scale.
+    if quant_type == QuantType.per_Token and w1.dtype == dtypes.fp8:
+        # Token-indexed, as per_token_quant_hip produces; stage1 gathers the
+        # rows and their scales through sorted_ids.
+        a1 = torch.empty(M, model_dim, dtype=q_dtype_out, device=device)
+        a1_scale_out = torch.empty(M, 1, dtype=dtypes.fp32, device=device)
+    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.fp4x2:
+        # Sized as fused_dynamic_mx_quant_moe_sort does: e8m0 scales in sorted
+        # row order, swizzled to the GEMM tile layout.
+        scaleN_pad = ((model_dim // group_size) + 7) // 8 * 8
+        a1 = torch.empty(M, model_dim // 2, dtype=q_dtype_out, device=device)
+        a1_scale_out = torch.empty(
+            (max_num_tokens_padded + 31) // 32 * 32,
+            scaleN_pad,
+            dtype=dtypes.fp8_e8m0,
+            device=device,
+        )
+    else:
+        raise NotImplementedError(
+            f"fused_moe_router: no stage1 buffers for fused quant {quant_type} "
+            f"with {w1.dtype} weights"
+        )
 
     fused_moe_router_impl(
         gating_output,
@@ -963,7 +1059,7 @@ def fused_moe_router(
         sorted_expert_ids,
         num_valid_ids,
         a1,
-        a1_scale_sorted,
+        a1_scale_out,
         global_E,
         topk,
         block_size_M,
@@ -977,8 +1073,35 @@ def fused_moe_router(
         shared_expert_weight=shared_expert_weight,
         ep_rank=ep_rank,
         ep_size=ep_size,
+        quant_type=quant_type.value,
     )
 
+    if metadata.run_1stage:
+        # a1 is already q_dtype_a, so fused_moe_1stage passes a1 and its
+        # token-indexed [M, 1] scale straight to fmoe_g1u1.
+        return metadata.stage1(
+            a1,
+            w1,
+            w2,
+            topk_total,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            isG1U1,
+            block_size_M,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=q_dtype_w,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale_out,
+            a2_scale=a2_scale,
+            num_local_tokens=num_local_tokens,
+            M=M,
+            device=device,
+            doweight_stage1=doweight_stage1,
+        )
     return fused_moe_2stages(
         hidden_states,
         w1,
@@ -1007,7 +1130,7 @@ def fused_moe_router(
         topk_weights=topk_weights,
         gate_mode=gate_mode,
         expert_mask=expert_mask,
-        a1_prequant=(a1, a1_scale_sorted),
+        a1_prequant=(a1, a1_scale_out),
     )
 
 
