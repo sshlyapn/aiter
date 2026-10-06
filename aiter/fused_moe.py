@@ -2048,6 +2048,9 @@ def fused_moe_router(
     # own padded block in the sort.
     max_num_tokens_padded = M * topk_total + E_tot * block_size_M - topk_total
     max_num_m_blocks = (max_num_tokens_padded + block_size_M - 1) // block_size_M
+    # Whole blocks, as _moe_sorting_impl rounds it: the A4W4 stage-2 GEMM loads
+    # every grid block's rows before its bounds check.
+    max_num_tokens_padded = max_num_m_blocks * block_size_M
     topk_ids = torch.empty((M, topk_total), dtype=dtypes.i32, device=device)
     topk_weights = torch.empty((M, topk_total), dtype=dtypes.fp32, device=device)
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
