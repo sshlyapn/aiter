@@ -1451,6 +1451,53 @@ def test_shared_topk_total_boundary(mode, topk, n_shared, ok):
             call()
 
 
+# The 512 cap is on routed experts alone. The pair scan reaches 2*BlockSize
+# slots; the fused shared tail past that is filled serially, so a full
+# 512-expert model runs with shared experts fused, under EP too.
+@pytest.mark.parametrize(
+    "E,n_shared,ep,ok",
+    [
+        (512, 0, None, True),
+        (512, 0, (0, 4, False), True),
+        (511, 1, None, True),
+        (512, 1, None, True),
+        (512, 1, (0, 4, False), True),
+        (512, 1, (3, 4, False), True),
+        (513, 0, None, False),
+        (513, 1, None, False),
+    ],
+)
+@pytest.mark.parametrize("mode", MODES)
+def test_expert_slot_cap(mode, E, n_shared, ep, ok):
+    M, topk, unit_size = 8, 8, 16
+    ep_rank, ep_size = (0, 1) if ep is None else (ep[0], ep[1])
+    mask = None if ep is None else _make_mask(E, ep_rank, ep_size, n_shared=n_shared)
+    g, b, h = _inputs(M, E, dtypes.bf16, 0)
+    shared = dict(n_shared=n_shared, shared_w=1.0, ep_rank=ep_rank, ep_size=ep_size)
+    if not ok:
+        # The stock path is only needed for buffer shapes, and it cannot run E.
+        ref = _run_stock(g, b, h, M, 320, topk, unit_size, True, 1.0, None, mode=mode)
+        got = _alloc(ref, M, topk + n_shared, mode)
+        with pytest.raises(RuntimeError):
+            _call_fused(
+                g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **shared,
+                mode=mode,
+            )
+        return
+    ref = _run_stock(
+        g, b, h, M, E, topk, unit_size, True, 1.0, mask, **shared, mode=mode
+    )
+    got = _alloc(ref, M, topk + n_shared, mode)
+    _call_fused(
+        g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **shared, mode=mode
+    )
+    torch.cuda.synchronize()
+    _assert_ok(
+        _compare(ref, got, M, topk + n_shared, unit_size, mode),
+        f"{mode} E={E} n_shared={n_shared} ep={ep}",
+    )
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_shared_bad_args_rejected(mode):
     """Configurations the entry cannot serve must be refused, not mis-routed."""
@@ -1958,6 +2005,36 @@ def test_fp8_moe_forced_path(M, want_1stage, monkeypatch):
     assert len(spy.calls) == int(want_1stage)
     monkeypatch.setattr(aiter, "fmoe_g1u1", real_fmoe)
     _assert_near_stock(out, h, g, b, W, f"M={M} forced 1stage={want_1stage}")
+
+
+# The router sorts with its config's block_m, so the stage kernels must come
+# from that same config. A second lookup in fused_moe_2stages keys on a
+# different topk under EP + shared fusion and can pick kernels tiled for
+# another block_m.
+@pytest.mark.parametrize("M", [1, 16, 64])
+def test_fp8_moe_single_cfg_lookup(M, monkeypatch):
+    import aiter.fused_moe as fm
+    from aiter import ActivationType
+
+    W = _fp8_moe_weights()
+    h, g, b = _moe_inputs(M, 300 + M)
+    w1, w2, w1s, w2s = W
+    kw = dict(
+        activation=ActivationType.Silu.value, quant_type=QuantType.per_Token.value
+    )
+    assert fm.fused_moe_router_supported(h, w1, w2, MOE_TOPK, **kw)
+    real, calls = fm.get_2stage_cfgs, []
+
+    def spy(*a, **k):
+        calls.append(a[:5])
+        return real(*a, **k)
+
+    monkeypatch.setattr(fm, "get_2stage_cfgs", spy)
+    out = fm.fused_moe_router(
+        h, g, b, w1, w2, MOE_TOPK, w1_scale=w1s, w2_scale=w2s, **kw
+    )
+    assert len(calls) == 1, f"M={M} 1stage={_moe_is_1stage(M)}: lookups {calls}"
+    _assert_near_stock(out, h, g, b, W, f"M={M} single lookup")
 
 
 @pytest.mark.parametrize("M", [1, 32, 128])

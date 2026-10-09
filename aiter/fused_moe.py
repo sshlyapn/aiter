@@ -1131,6 +1131,7 @@ def fused_moe_router(
         gate_mode=gate_mode,
         expert_mask=expert_mask,
         a1_prequant=(a1, a1_scale_out),
+        _metadata=metadata,
     )
 
 
@@ -2295,6 +2296,9 @@ def fused_moe_2stages(
     expert_mask=None,
     # (a1, a1_scale) already quantized+sorted by the caller; skips stage1 quant.
     a1_prequant=None,
+    # Final config from a caller that already looked it up. The caller sorted
+    # with its block_m, so the stage kernels must come from the same config.
+    _metadata: Optional[MOEMetadata] = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2305,25 +2309,28 @@ def fused_moe_2stages(
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
-    metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        is_shuffled,
-        gate_mode,
-        is_ep=expert_mask is not None,
-    )
+    if _metadata is not None:
+        metadata = _metadata
+    else:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token_num),  # consider token_num > 1024 as prefill
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            is_shuffled,
+            gate_mode,
+            is_ep=expert_mask is not None,
+        )
     if a1_prequant is not None:
         a1, a1_scale = a1_prequant
     elif (

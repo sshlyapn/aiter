@@ -294,7 +294,7 @@ def s_allocator_poison(cfg):
                 g, b, h, ref = _case(M)
                 shapes = {
                     k: (ref[k].shape, ref[k].dtype)
-                    for k in ("sids", "sw", "seids", "nv", "o4", "osc")
+                    for k in ("sids", "sw", "seids", "nv", "a1", "a1s")
                 }
                 # Dirty the pool with blocks of exactly the sizes about to be
                 # requested, then drop them.
@@ -387,9 +387,11 @@ def s_determinism(cfg):
                     torch.cuda.synchronize()
                     snap = {
                         k: got[k].clone()
-                        for k in ("ti", "tw", "sids", "sw", "seids", "nv", "o4")
+                        for k in ("ti", "tw", "sids", "sw", "seids", "nv", "a1")
                     }
-                    snap["osc"] = T._deswizzle(got["osc"], nv).clone()
+                    snap["a1s"] = T._deswizzle(
+                        got["a1s"], nv, h.shape[1] // T.GROUP_SIZE
+                    ).clone()
                     if base is None:
                         base = snap
                         e = _errs(ref, got, M, TOPK0, U0)
@@ -442,7 +444,7 @@ def s_graph(cfg):
                 T._call_fused(g, b, h, got, E0, TOPK0, U0, True, 1.0, None, None)
 
             for r in range(cfg.replays):
-                for k in ("sids", "sw", "seids", "o4", "osc"):
+                for k in ("sids", "sw", "seids", "a1", "a1s"):
                     _fill_pat(got[k], r)
                 got["nv"].zero_()
                 graph.replay()

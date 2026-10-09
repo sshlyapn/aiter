@@ -416,8 +416,7 @@ void fused_moe_router_impl(
     };
 
     // MXFP4 passes its (QuantType, out type) explicitly, which names the same
-    // instantiation as the kernel's defaults. FP8 has no shared-expert fusion
-    // (checked above), so only NSHARED == 0 is instantiated for it.
+    // instantiation as the kernel's defaults.
     auto dispatch_quant = [&](auto bias_tag) {
         if(qt == QuantType::per_Token)
             dispatch_shared(bias_tag,
