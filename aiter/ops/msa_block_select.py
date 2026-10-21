@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 
 from aiter.jit.core import compile_ops
 
@@ -30,6 +31,8 @@ def _score_decode_raw(
     head_dim: int,
     num_idx_heads: int,
     num_waves: int,
+    kv_fmt: int,
+    page_stride: int,
 ) -> None: ...
 
 
@@ -59,6 +62,9 @@ def _score_prefill_raw(
     num_idx_heads: int,
     num_waves: int,
     q_tiles: int,
+    kv_fmt: int,
+    page_stride: int,
+    waves_per_eu: int,
 ) -> None: ...
 
 
@@ -134,6 +140,78 @@ SCORE_PREFILL_GROUPS_PER_BLOCK = 64
 SCORE_MAX_Q_TILES = 4
 
 SCORE_PREFILL_MAX_Q_TILES = 4
+
+# Index key formats, as the kernels number them (kKvFp8 / kKvNvfp4).
+KV_FMT_FP8 = 0
+KV_FMT_NVFP4 = 1
+_KV_FMTS = {"fp8": KV_FMT_FP8, "nvfp4": KV_FMT_NVFP4}
+
+# Block size of a 2D ``[num_pages, page_bytes]`` nvfp4 cache, the only one built.
+NVFP4_BLOCK_SIZE = 128
+
+# Prefill (waves, min waves per SIMD) pairs that are built; the first is the
+# default.
+SCORE_PREFILL_CFGS = ((SCORE_WAVES, 0), (8, 0), (8, 6))
+
+# Experimental knobs, read from the environment on every call. Launch dimensions
+# depend on them, so keep them fixed for the life of a cudagraph capture.
+#   AITER_MSA_INDEX_KV_FMT: index key cache format, "fp8" (default) or "nvfp4".
+#   AITER_MSA_PREFILL_CFG: "QT,WG,WPE" -- cap on query tiles per wave, waves
+#       per workgroup and min waves per SIMD of the prefill pass, from
+#       SCORE_PREFILL_CFGS. Unset keeps the default resolution. "2,8,6" with
+#       AITER_MSA_PREFILL_CHUNK_BLOCKS=4 measured 1.08-1.36x faster than the
+#       defaults for both formats (MI355X, 8k-128k contexts, 1-2 index heads).
+#   AITER_MSA_PREFILL_CHUNK_BLOCKS: pages per block-axis chunk of the prefill
+#       pass, overriding _score_split_prefill. 4 pairs with
+#       AITER_MSA_PREFILL_CFG="2,8,6" (see above); 16 is slower at 8k.
+ENV_KV_FMT = "AITER_MSA_INDEX_KV_FMT"
+ENV_PREFILL_CFG = "AITER_MSA_PREFILL_CFG"
+ENV_PREFILL_CHUNK_BLOCKS = "AITER_MSA_PREFILL_CHUNK_BLOCKS"
+
+
+def nvfp4_page_bytes(block_size: int, head_dim: int) -> int:
+    """Bytes of one nvfp4 index key page: e2m1 pairs, then one e4m3 scale per
+    16 dims of every token."""
+    return block_size * head_dim // 2 + block_size * head_dim // 16
+
+
+def index_kv_fmt() -> int:
+    """The index key cache format selected by AITER_MSA_INDEX_KV_FMT."""
+    name = os.environ.get(ENV_KV_FMT, "fp8").strip().lower() or "fp8"
+    if name not in _KV_FMTS:
+        raise ValueError(f"{ENV_KV_FMT}={name!r}; expected one of {list(_KV_FMTS)}")
+    return _KV_FMTS[name]
+
+
+def _env_prefill_cfg():
+    """``(max_q_tiles, waves, waves_per_eu)`` from AITER_MSA_PREFILL_CFG, or
+    None when unset."""
+    raw = os.environ.get(ENV_PREFILL_CFG, "").strip()
+    if not raw:
+        return None
+    try:
+        q_tiles, waves, wpe = (int(v) for v in raw.split(","))
+    except ValueError:
+        raise ValueError(f"{ENV_PREFILL_CFG}={raw!r}; expected 'QT,WG,WPE'") from None
+    if q_tiles not in (1, 2, 4) or (waves, wpe) not in SCORE_PREFILL_CFGS:
+        raise ValueError(
+            f"{ENV_PREFILL_CFG}={raw!r} is not built; QT in (1, 2, 4) and "
+            f"(WG, WPE) in {list(SCORE_PREFILL_CFGS)}"
+        )
+    if wpe == 6 and q_tiles > 2:
+        # Four tiles do not fit the 80 VGPRs of 6 waves per SIMD; they spill.
+        raise ValueError(f"{ENV_PREFILL_CFG}={raw!r}: WPE=6 needs QT <= 2")
+    return q_tiles, waves, wpe
+
+
+def _env_prefill_chunk_blocks() -> int:
+    """Pages per prefill chunk from AITER_MSA_PREFILL_CHUNK_BLOCKS, 0 when unset."""
+    raw = os.environ.get(ENV_PREFILL_CHUNK_BLOCKS, "").strip()
+    if not raw:
+        return 0
+    if not raw.isdigit() or int(raw) < 1:
+        raise ValueError(f"{ENV_PREFILL_CHUNK_BLOCKS}={raw!r}; expected a positive int")
+    return int(raw)
 
 
 def _pow2_floor(n: int) -> int:
@@ -228,19 +306,34 @@ def _score_split_prefill(max_blk: int, num_groups: int) -> tuple[int, int]:
     return max(1, math.ceil(max_blk / blocks)), blocks
 
 
-def _check_score_tensors(q_idx, key_cache_idx, score):
+def _check_score_tensors(q_idx, key_cache_idx, score, kv_fmt: int = KV_FMT_FP8):
     """Shared dtype/layout contract of both scoring passes.
 
-    Returns ``(total_q, num_idx_heads, head_dim, block_size)``.
+    fp8 keys are ``[num_pages, block_size, head_dim]`` in q's dtype. nvfp4 keys
+    may be any 1-byte dtype, either ``[num_pages, block_size, head_dim]`` with the
+    nvfp4 page at the head of every page's bytes, or ``[num_pages, >= page
+    bytes]`` at block size NVFP4_BLOCK_SIZE.
+
+    Returns ``(total_q, num_idx_heads, head_dim, block_size, page_stride)``.
     """
     import torch
 
-    if q_idx.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        raise ValueError(f"q_idx must be fp8 e4m3, got {q_idx.dtype}")
-    if key_cache_idx.dtype != q_idx.dtype:
-        raise ValueError(
-            f"dtype mismatch: key_cache_idx={key_cache_idx.dtype}, q_idx={q_idx.dtype}"
-        )
+    if kv_fmt == KV_FMT_NVFP4:
+        # The decode table produces OCP e4m3, which q has to match.
+        if q_idx.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"nvfp4 keys need float8_e4m3fn q_idx, got {q_idx.dtype}")
+        if key_cache_idx.element_size() != 1:
+            raise ValueError(
+                f"nvfp4 key_cache_idx must be a byte tensor, got {key_cache_idx.dtype}"
+            )
+    else:
+        if q_idx.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            raise ValueError(f"q_idx must be fp8 e4m3, got {q_idx.dtype}")
+        if key_cache_idx.dtype != q_idx.dtype:
+            raise ValueError(
+                f"dtype mismatch: key_cache_idx={key_cache_idx.dtype}, "
+                f"q_idx={q_idx.dtype}"
+            )
     if score.dtype != torch.float32:
         raise ValueError(f"score must be fp32, got {score.dtype}")
     if not (q_idx.is_contiguous() and key_cache_idx.is_contiguous()):
@@ -249,12 +342,21 @@ def _check_score_tensors(q_idx, key_cache_idx, score):
         raise ValueError("score must be contiguous along the block axis")
 
     total_q, num_idx_heads, head_dim = q_idx.shape
-    block_size = key_cache_idx.size(1)
-    if key_cache_idx.size(2) != head_dim:
-        raise ValueError("key_cache_idx head dim must match q_idx")
+    if kv_fmt == KV_FMT_NVFP4 and key_cache_idx.dim() == 2:
+        block_size = NVFP4_BLOCK_SIZE
+        if key_cache_idx.size(1) < nvfp4_page_bytes(block_size, head_dim):
+            raise ValueError(
+                f"nvfp4 key_cache_idx pages hold {key_cache_idx.size(1)} bytes, "
+                f"need {nvfp4_page_bytes(block_size, head_dim)}"
+            )
+    else:
+        block_size = key_cache_idx.size(1)
+        if key_cache_idx.dim() != 3 or key_cache_idx.size(2) != head_dim:
+            raise ValueError("key_cache_idx must be [num_pages, block_size, head_dim]")
     if score.size(0) != num_idx_heads or score.size(1) != total_q:
         raise ValueError("score must be [num_idx_heads, total_q, S]")
-    return total_q, num_idx_heads, head_dim, block_size
+    page_stride = key_cache_idx.stride(0) * key_cache_idx.element_size()
+    return total_q, num_idx_heads, head_dim, block_size, page_stride
 
 
 def _launch_score_decode(
@@ -273,6 +375,8 @@ def _launch_score_decode(
     num_idx_heads: int,
     head_dim: int,
     block_size: int,
+    kv_fmt: int = KV_FMT_FP8,
+    page_stride: int = 0,
 ):
     """Launch the uniform-row score kernel.
 
@@ -302,6 +406,8 @@ def _launch_score_decode(
         head_dim,
         num_idx_heads,
         num_waves,
+        kv_fmt,
+        page_stride,
     )
     return score
 
@@ -324,6 +430,9 @@ def _launch_score_prefill(
     head_dim: int,
     block_size: int,
     q_tiles: int,
+    kv_fmt: int = KV_FMT_FP8,
+    page_stride: int = 0,
+    waves_per_eu: int = 0,
 ):
     """Launch the ragged-row score kernel.
 
@@ -357,6 +466,9 @@ def _launch_score_prefill(
         num_idx_heads,
         num_waves,
         q_tiles,
+        kv_fmt,
+        page_stride,
+        waves_per_eu,
     )
     return score
 
@@ -384,6 +496,8 @@ def pa_sparse_block_score_decode(
     Args:
         q_idx: ``[num_reqs * query_len, num_idx_heads, head_dim]`` fp8 e4m3, contiguous.
         key_cache_idx: ``[num_pages, block_size, head_dim]`` fp8 e4m3, contiguous.
+            nvfp4 pages instead with AITER_MSA_INDEX_KV_FMT=nvfp4, see
+            ``_check_score_tensors``.
         score: ``[num_idx_heads, num_reqs * query_len, S]`` fp32, written in place.
             Blocks past ``cdiv(seq_len, block_size)`` are left untouched, so
             pre-fill with ``-inf``.
@@ -400,8 +514,9 @@ def pa_sparse_block_score_decode(
             actually served is safe and costs only what the grid ceiling in
             ``_score_split`` does not already trim.
     """
-    total_q, num_idx_heads, head_dim, block_size = _check_score_tensors(
-        q_idx, key_cache_idx, score
+    kv_fmt = index_kv_fmt()
+    total_q, num_idx_heads, head_dim, block_size, page_stride = _check_score_tensors(
+        q_idx, key_cache_idx, score, kv_fmt
     )
     if total_q % query_len != 0:
         raise ValueError(
@@ -440,6 +555,8 @@ def pa_sparse_block_score_decode(
         num_idx_heads=num_idx_heads,
         head_dim=head_dim,
         block_size=block_size,
+        kv_fmt=kv_fmt,
+        page_stride=page_stride,
     )
 
 
@@ -472,6 +589,8 @@ def pa_sparse_block_score_prefill(
     Args:
         q_idx: ``[total_q, num_idx_heads, head_dim]`` fp8 e4m3, contiguous.
         key_cache_idx: ``[num_pages, block_size, head_dim]`` fp8 e4m3, contiguous.
+            nvfp4 pages instead with AITER_MSA_INDEX_KV_FMT=nvfp4, see
+            ``_check_score_tensors``.
         score: ``[num_idx_heads, total_q, S]`` fp32, written in place. Blocks a
             row cannot see are left untouched, so pre-fill with ``-inf`` unless
             the consumer bounds each row itself (``pa_sparse_block_topk`` does).
@@ -492,8 +611,9 @@ def pa_sparse_block_score_prefill(
             is safe and costs only what the grid ceiling in
             ``_score_split_prefill`` does not already trim.
     """
-    total_q, num_idx_heads, head_dim, block_size = _check_score_tensors(
-        q_idx, key_cache_idx, score
+    kv_fmt = index_kv_fmt()
+    total_q, num_idx_heads, head_dim, block_size, page_stride = _check_score_tensors(
+        q_idx, key_cache_idx, score, kv_fmt
     )
     if num_idx_heads > SCORE_MFMA_COLS:
         raise ValueError(
@@ -520,6 +640,7 @@ def pa_sparse_block_score_prefill(
 
     num_tiles = math.ceil(max_query_len / _tokens_per_tile(num_idx_heads))
     num_waves = SCORE_WAVES
+    waves_per_eu = 0
 
     # Tiles per wave, and the waves are every wave of the workgroup: the page is
     # staged once for all of them, so folding costs registers and nothing else
@@ -527,11 +648,22 @@ def pa_sparse_block_score_prefill(
     # the tiles there are is not a problem -- the waves past the end come out
     # with no live tiles, which masks their loads, their MFMAs and their stores
     # while they still carry their share of the page.
-    q_tiles = _resolve_q_tiles_prefill(num_tiles, num_reqs, num_waves)
+    cfg = _env_prefill_cfg()
+    if cfg is None:
+        q_tiles = _resolve_q_tiles_prefill(num_tiles, num_reqs, num_waves)
+    else:
+        max_q_tiles, num_waves, waves_per_eu = cfg
+        q_tiles = _pow2_floor(min(max_q_tiles, max(1, num_tiles // num_waves)))
     num_q_groups = math.ceil(num_tiles / (q_tiles * num_waves))
 
     max_blk = math.ceil(max_seq_len / block_size)
-    num_chunks, chunk_blocks = _score_split_prefill(max_blk, num_q_groups * num_reqs)
+    chunk_blocks = _env_prefill_chunk_blocks()
+    if chunk_blocks:
+        num_chunks = math.ceil(max_blk / chunk_blocks)
+    else:
+        num_chunks, chunk_blocks = _score_split_prefill(
+            max_blk, num_q_groups * num_reqs
+        )
 
     return _launch_score_prefill(
         q_idx,
@@ -551,6 +683,9 @@ def pa_sparse_block_score_prefill(
         head_dim=head_dim,
         block_size=block_size,
         q_tiles=q_tiles,
+        kv_fmt=kv_fmt,
+        page_stride=page_stride,
+        waves_per_eu=waves_per_eu,
     )
 
 

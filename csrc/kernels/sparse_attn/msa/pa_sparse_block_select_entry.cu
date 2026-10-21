@@ -37,11 +37,28 @@ inline bool sparse_arch_supported()
                      "the running device is ",          \
                 get_gpu_arch())
 
-#define SPARSE_DECODE_DISPATCH(H, W)                                          \
-    if(num_idx_heads == (H) && num_waves == (W))                              \
-    {                                                                         \
-        aiter::sparse_attn::SPARSE_DECODE_FN(H, W)(SPARSE_SCORE_DECODE_ARGS); \
-        return;                                                               \
+// fp8 pages are dense and the kernels never read the stride; an nvfp4 page only
+// has to fit in it.
+constexpr int kSparseNvfp4PageBytes =
+    aiter::sparse_attn::nvfp4_page<SPARSE_BLOCK_SIZE, SPARSE_HEAD_DIM>::kBytes;
+
+#define SPARSE_CHECK_KV_FMT(pass)                                                               \
+    AITER_CHECK(kv_fmt == aiter::sparse_attn::kKvFp8 || kv_fmt == aiter::sparse_attn::kKvNvfp4, \
+                pass ": kv_fmt ",                                                               \
+                kv_fmt,                                                                         \
+                " unsupported; 0 = fp8, 1 = nvfp4");                                            \
+    AITER_CHECK(kv_fmt != aiter::sparse_attn::kKvNvfp4 || page_stride >= kSparseNvfp4PageBytes, \
+                pass ": nvfp4 page_stride ",                                                    \
+                page_stride,                                                                    \
+                " is smaller than one nvfp4 page, ",                                            \
+                kSparseNvfp4PageBytes,                                                          \
+                " bytes")
+
+#define SPARSE_DECODE_DISPATCH(K, H, W)                                          \
+    if(kv_fmt == (K) && num_idx_heads == (H) && num_waves == (W))                \
+    {                                                                            \
+        aiter::sparse_attn::SPARSE_DECODE_FN(K, H, W)(SPARSE_SCORE_DECODE_ARGS); \
+        return;                                                                  \
     }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
@@ -63,6 +80,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
                                      int head_dim,
                                      int num_idx_heads,
                                      int num_waves,
+                                     int kv_fmt,
+                                     int page_stride,
                                      hipStream_t stream),
                                     (q_idx_ptr,
                                      key_cache_idx_ptr,
@@ -82,10 +101,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
                                      head_dim,
                                      num_idx_heads,
                                      num_waves,
+                                     kv_fmt,
+                                     page_stride,
                                      stream))
 {
     SPARSE_CHECK_ARCH("pa_sparse_block_score_decode");
     SPARSE_CHECK_SHAPE("pa_sparse_block_score_decode");
+    SPARSE_CHECK_KV_FMT("pa_sparse_block_score_decode");
 
     const auto* q_idx         = reinterpret_cast<const uint8_t*>(q_idx_ptr);
     const auto* key_cache_idx = reinterpret_cast<const uint8_t*>(key_cache_idx_ptr);
@@ -96,17 +118,20 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
     SPARSE_DECODE_TABLE(SPARSE_DECODE_DISPATCH)
 
     AITER_CHECK(false,
-                "pa_sparse_block_score_decode: no build for num_idx_heads=",
+                "pa_sparse_block_score_decode: no build for kv_fmt=",
+                kv_fmt,
+                " num_idx_heads=",
                 num_idx_heads,
                 " num_waves=",
                 num_waves);
 }
 
-#define SPARSE_PREFILL_DISPATCH(H, Q)                                           \
-    if(num_idx_heads == (H) && q_tiles == (Q))                                  \
-    {                                                                           \
-        aiter::sparse_attn::SPARSE_PREFILL_FN(H, Q)(SPARSE_SCORE_PREFILL_ARGS); \
-        return;                                                                 \
+#define SPARSE_PREFILL_DISPATCH(K, H, Q, W, E)                                           \
+    if(kv_fmt == (K) && num_idx_heads == (H) && q_tiles == (Q) && num_waves == (W) &&    \
+       waves_per_eu == (E))                                                              \
+    {                                                                                    \
+        aiter::sparse_attn::SPARSE_PREFILL_FN(K, H, Q, W, E)(SPARSE_SCORE_PREFILL_ARGS); \
+        return;                                                                          \
     }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_prefill,
@@ -130,6 +155,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_prefill,
                                      int num_idx_heads,
                                      int num_waves,
                                      int q_tiles,
+                                     int kv_fmt,
+                                     int page_stride,
+                                     int waves_per_eu,
                                      hipStream_t stream),
                                     (q_idx_ptr,
                                      key_cache_idx_ptr,
@@ -151,17 +179,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_prefill,
                                      num_idx_heads,
                                      num_waves,
                                      q_tiles,
+                                     kv_fmt,
+                                     page_stride,
+                                     waves_per_eu,
                                      stream))
 {
     SPARSE_CHECK_ARCH("pa_sparse_block_score_prefill");
     SPARSE_CHECK_SHAPE("pa_sparse_block_score_prefill");
-    // The workgroup stages one page for all of its waves, so the wave count is
-    // part of that mapping and not a variant axis.
-    AITER_CHECK(num_waves == SPARSE_PREFILL_WAVES,
-                "pa_sparse_block_score_prefill: num_waves ",
-                num_waves,
-                " is not built; this build carries num_waves ",
-                SPARSE_PREFILL_WAVES);
+    SPARSE_CHECK_KV_FMT("pa_sparse_block_score_prefill");
 
     const auto* q_idx         = reinterpret_cast<const uint8_t*>(q_idx_ptr);
     const auto* key_cache_idx = reinterpret_cast<const uint8_t*>(key_cache_idx_ptr);
@@ -173,10 +198,16 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_prefill,
     SPARSE_PREFILL_TABLE(SPARSE_PREFILL_DISPATCH)
 
     AITER_CHECK(false,
-                "pa_sparse_block_score_prefill: no build for num_idx_heads=",
+                "pa_sparse_block_score_prefill: no build for kv_fmt=",
+                kv_fmt,
+                " num_idx_heads=",
                 num_idx_heads,
                 " q_tiles=",
-                q_tiles);
+                q_tiles,
+                " num_waves=",
+                num_waves,
+                " waves_per_eu=",
+                waves_per_eu);
 }
 
 // ---------------------------------------------------------------------------
