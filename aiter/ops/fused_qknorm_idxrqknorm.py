@@ -9,6 +9,9 @@ from ..jit.core import compile_ops
 
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q = True
+# kv_cache_dtype="nvfp4" (MiniMax-M3 NVFP4 in page-16 fp8 pages) and
+# index_cache_dtype="nvfp4" (AITER MSA NVFP4 index pages).
+FUSED_QKNORM_IDXRQKNORM_SUPPORTS_NVFP4 = True
 
 _FP8_E4M3_DTYPES = tuple(
     dt
@@ -93,6 +96,13 @@ def fused_qknorm_idxrqknorm(
     # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
     # kv_cache_v are typically the key/value slices of a fused
     # [num_blocks, 2, block_size, num_kv_heads, head_dim] cache).
+    #
+    # kv_cache_dtype="nvfp4" writes K/V as NVFP4 into page-16 fp8 byte pages
+    # (block_size 16, asm_layout ignored): kv_cache_k / kv_cache_v are
+    # [pages, num_kv_heads, ...] views with 2048 B head chunks, or compact
+    # 2304 B pages for one KV head; k_scale / v_scale are optional
+    # single-element divisors. index_cache_dtype="nvfp4" writes the index key
+    # in the AITER MSA NVFP4 layout (see msa_index_cache_insert).
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
@@ -126,6 +136,10 @@ def fused_qknorm_idxrqknorm(
         else:
             assert k_scale is None
             assert v_scale is None
+    elif kv_cache_dtype == "nvfp4":
+        assert slot_mapping is not None
+        assert kv_cache_v is not None
+        assert (k_scale is None) == (v_scale is None)
 
     _fused_qknorm_idxrqknorm_hip(
         qkv,
