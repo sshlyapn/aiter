@@ -47,6 +47,9 @@ SHAPES = [
     (128, 3072, 3072, 4),  # GPT-OSS TP=1
     (129, 6144, 512, 5),  # MiniMax-M3 (INTER 384 pads to 512)
     (129, 6144, 768, 5),  # MiniMax-M3
+    (128, 6144, 768, 4),  # MiniMax-M3 TP4 E128 top_k=4 (no fused shared)
+    (128, 6144, 1536, 4),  # MiniMax-M3 TP2
+    (128, 6144, 3072, 4),  # MiniMax-M3 TP1
     (256, 3072, 256, 8),  # MiniMax-M2.5 TP=6
     (256, 3072, 512, 8),  # MiniMax-M2.5 (INTER 384 pads to 512)
     (256, 7168, 256, 8),  # DSV3/Kimi-K2 E256
