@@ -2500,7 +2500,8 @@ def flydsl_mxfp_moe_stage1(
         xcd_swizzle=params["xcd_swizzle"],
         swiglu_limit=None if swiglu_limit is None else float(swiglu_limit),
     )
-    dtypes = _get_dtypes()
+    from aiter.utility import dtypes
+
     if os.environ.get("COMPILE_ONLY") == "1":
         aq2 = torch.empty((rows, kp), dtype=torch.int8, device=hidden_states.device)
         sa2 = torch.empty(
