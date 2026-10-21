@@ -1012,6 +1012,94 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 #     cache_results=True,
 # )
 @gluon.jit
+def _nvfp4_load_kv_scales(
+    kv_block_scale_ptr,
+    kv_block_numbers,
+    block_element_offsets,
+    stride_block,
+    SCALE_LAYOUT: gl.constexpr,
+):
+    """Loads the int32 [blocks, 4, tokens] K/V scale words of a tile.
+
+    Byte j of word s holds the scale of head_size split s + 4 * (j % 2) of K
+    (j < 2) or V (j >= 2), matching the split ownership of blocked_key_layout.
+    """
+    split_offsets = gl.arange(
+        0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, SCALE_LAYOUT))
+    )
+    return gl.load(
+        kv_block_scale_ptr
+        + kv_block_numbers.to(gl.int64)[:, None, None] * stride_block
+        + (block_element_offsets[None, None, :] * 4 + split_offsets[None, :, None])
+    )
+
+
+@gluon.jit
+def _nvfp4_split_scales(kv_scales, SHIFT: gl.constexpr, LAYOUT: gl.constexpr):
+    """[blocks, 8, tokens] K (SHIFT 0) or V (SHIFT 16) scale bytes."""
+    scales = gl.join((kv_scales >> SHIFT) & 0xFF, (kv_scales >> (SHIFT + 8)) & 0xFF)
+    scales = gl.permute(scales, [0, 3, 1, 2])
+    shape: gl.constexpr = [
+        kv_scales.shape[0],
+        2 * kv_scales.shape[1],
+        kv_scales.shape[2],
+    ]
+    return gl.convert_layout(gl.reshape(scales, shape), LAYOUT)
+
+
+# Decodes one NVFP4 word, 8 elements with A = elements 0..3 and B = 4..7,
+# whose byte j holds |A_j| in bits 0-2, sign(B_{j-1 mod 4}) in bit 3, |B_j|
+# in bits 4-6 and sign(A_j) in bit 7. v_perm looks the magnitudes up in the
+# 8-byte LUT row of the block scale, then the sign bits are XORed in.
+# $0/$1: E4M3 bytes of A/B, $2: scratch, $3: word, $4/$5: LUT row,
+# $6: 0x80808080. The hazard recognizer counts the block as one
+# instruction, so the trailing s_nop covers a VALU -> MFMA read of $1.
+_NVFP4_DECODE_ASM = gl.constexpr("""
+v_and_b32 $2, 0x07070707, $3
+v_perm_b32 $0, $5, $4, $2
+v_bitop3_b32 $0, $0, $3, $6 bitop3:0x78
+v_alignbit_b32 $2, $3, $3, 4
+v_and_b32 $1, 0x07070707, $2
+v_perm_b32 $1, $5, $4, $1
+v_bitop3_b32 $1, $1, $2, $6 bitop3:0x78
+s_nop 1
+""")
+
+
+@gluon.jit
+def _nvfp4_decode(
+    words, scale, lut_shared, SHAPE: gl.constexpr, LAYOUT: gl.constexpr
+):
+    """E4M3(E2M1 * scale) of rows of NVFP4 int32 words.
+
+    scale holds the E4M3 bits of each row and lut_shared the [256] int64
+    table of E4M3(|E2M1| * scale) bytes.
+    """
+    lut = lut_shared.gather(gl.reshape(scale, [scale.numel]), 0)
+    lut = gl.convert_layout(gl.reshape(lut, scale.shape), scale.type.layout)
+    lut_lo = lut.to(gl.int32)
+    lut_hi = (lut >> 32).to(gl.int32)
+    sign_mask = gl.full(words.shape, -0x7F7F7F80, gl.int32, words.type.layout)
+    lo, hi, _ = gl.inline_asm_elementwise(
+        _NVFP4_DECODE_ASM,
+        "=&v,=&v,=&v,v,v,v,v",
+        [words, lut_lo[:, :, :, None], lut_hi[:, :, :, None], sign_mask],
+        dtype=(gl.int32, gl.int32, gl.int32),
+        is_pure=True,
+        pack=1,
+    )
+    values = gl.join(lo, hi)
+    values = gl.join(
+        gl.join((values & 0xFF).to(gl.uint8), ((values >> 16) & 0xFF).to(gl.uint8)),
+        gl.join(
+            ((values >> 8) & 0xFF).to(gl.uint8), ((values >> 24) & 0xFF).to(gl.uint8)
+        ),
+    )
+    values = gl.convert_layout(gl.reshape(values, SHAPE), LAYOUT)
+    return values.to(gl.float8e4nv, bitcast=True)
+
+
+@gluon.jit
 def paged_attention_decode_sliding_window_head_1(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -1069,6 +1157,10 @@ def paged_attention_decode_sliding_window_head_1(
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
+    kv_block_scale_ptr=None,  # int32 [num_blocks, 1, kv_block_size, 4]
+    stride_kv_block_scale_block: int = 0,
+    nvfp4_lut_ptr=None,  # [256] int64
+    KV_NVFP4: gl.constexpr = False,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -1076,6 +1168,11 @@ def paged_attention_decode_sliding_window_head_1(
     This kernel implements the attention mechanism for decoding in transformer models
     with support for paged KV caches and FP8 quantization. It handles causal masking,
     ALiBi biases, and various quantization schemes.
+
+    With KV_NVFP4 both caches are int32 [num_blocks, 1, head_size // 16,
+    kv_block_size, 2] NVFP4 words (see _NVFP4_DECODE_ASM) with one E4M3
+    scale per 16 head_size elements (see _nvfp4_load_kv_scales), decoded in
+    registers to E4M3(E2M1 * scale).
 
     Args:
         exp_sums_ptr: Pointer to exponential sums output tensor
@@ -1104,16 +1201,26 @@ def paged_attention_decode_sliding_window_head_1(
         or query_ptr.dtype.element_ty == gl.bfloat16
         or query_ptr.dtype.element_ty == gl.float16
     )
-    gl.static_assert(
-        key_cache_ptr.dtype.is_fp8()
-        or key_cache_ptr.dtype.element_ty == gl.bfloat16
-        or key_cache_ptr.dtype.element_ty == gl.float16
-    )
-    gl.static_assert(
-        value_cache_ptr.dtype.is_fp8()
-        or value_cache_ptr.dtype.element_ty == gl.bfloat16
-        or value_cache_ptr.dtype.element_ty == gl.float16
-    )
+    if KV_NVFP4:
+        gl.static_assert(key_cache_ptr.dtype.element_ty == gl.int32)
+        gl.static_assert(value_cache_ptr.dtype.element_ty == gl.int32)
+        gl.static_assert(COMPUTE_TYPE == gl.float8e4nv)
+        gl.static_assert(KV_QUANT_MODE == 0)
+        gl.static_assert(VALUE_TRANSPOSED)
+        gl.static_assert(KV_BLOCK_SIZE == 16)
+        gl.static_assert(HEAD_SIZE_POW2 == 128)
+        gl.static_assert(CONTEXT_PARTITION_SIZE > KV_BLOCK_SIZE)
+    else:
+        gl.static_assert(
+            key_cache_ptr.dtype.is_fp8()
+            or key_cache_ptr.dtype.element_ty == gl.bfloat16
+            or key_cache_ptr.dtype.element_ty == gl.float16
+        )
+        gl.static_assert(
+            value_cache_ptr.dtype.is_fp8()
+            or value_cache_ptr.dtype.element_ty == gl.bfloat16
+            or value_cache_ptr.dtype.element_ty == gl.float16
+        )
 
     if QUERY_QUANT_MODE >= 0:
         gl.static_assert(query_scale.dtype.element_ty == gl.float32)
@@ -1201,7 +1308,18 @@ def paged_attention_decode_sliding_window_head_1(
     key_warps_per_cta: gl.constexpr = (
         [4, 1, 1, 1] if KV_COMPUTE_BLOCK_SIZE == 16 else [1, 1, 4, 1]
     )
+    # NVFP4 loads int32 words of 8 elements.
+    if KV_NVFP4:
+        KV_LOAD_ELEMENT_COUNT: gl.constexpr = KV_16B_ELEMENT_COUNT // 8
+    else:
+        KV_LOAD_ELEMENT_COUNT: gl.constexpr = KV_16B_ELEMENT_COUNT
     blocked_key_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1, 1, KV_LOAD_ELEMENT_COUNT],
+        threads_per_warp=[1, 4, 16, 1],
+        warps_per_cta=key_warps_per_cta,
+        order=[3, 2, 1, 0],
+    )
+    key_upcast_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1, 1, KV_16B_ELEMENT_COUNT],
         threads_per_warp=[1, 4, 16, 1],
         warps_per_cta=key_warps_per_cta,
@@ -1361,7 +1479,7 @@ def paged_attention_decode_sliding_window_head_1(
         0, KV_COMPUTE_BLOCK_SIZE, layout=block_element_layout
     )
     contiguous_kv_element_offsets = gl.arange(
-        0, KV_16B_ELEMENT_COUNT, layout=contiguous_kv_elements_layout
+        0, KV_LOAD_ELEMENT_COUNT, layout=contiguous_kv_elements_layout
     )
     max_logits_base_offsets = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
@@ -1603,6 +1721,22 @@ def paged_attention_decode_sliding_window_head_1(
         [CONTEXT_PARTITION_SIZE],
         shared_key_scale_layout,
     )
+    if KV_NVFP4:
+        # Transposes the decoded value rows into the PV operand, which loads
+        # with ds_read_b64_tr_b8. The swizzle spreads the 16 B stores of 16
+        # consecutive rows over all banks.
+        value_shared = gl.allocate_shared_memory(
+            COMPUTE_TYPE,
+            [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2],
+            gl.SwizzledSharedLayout(16, 2, 8, order=[1, 0]),
+        )
+        lut_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+        nvfp4_lut_shared = gl.allocate_shared_memory(
+            gl.int64,
+            [256],
+            gl.SwizzledSharedLayout(1, 1, 1, order=[0]),
+            gl.load(nvfp4_lut_ptr + gl.arange(0, 256, layout=lut_layout)),
+        )
     if QUERY_QUANT_MODE == 0:
         query_scale_value = gl.load(query_scale)
     elif QUERY_QUANT_MODE == 1:
@@ -1687,6 +1821,14 @@ def paged_attention_decode_sliding_window_head_1(
         )
 
     key_tensor = gl.load(key_cache_ptr + key_block_offsets)
+    if KV_NVFP4:
+        kv_block_scale = _nvfp4_load_kv_scales(
+            kv_block_scale_ptr,
+            kv_block_numbers,
+            page_offset + block_element_offsets,
+            stride_kv_block_scale_block,
+            gl.SliceLayout(3, blocked_key_layout),
+        )
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
         sequence_partition_start_idx,
@@ -1729,6 +1871,30 @@ def paged_attention_decode_sliding_window_head_1(
             )
             value_scale_shared.store(value_scale_value_blocked)
 
+        if KV_NVFP4:
+            # The value cache has the key cache layout.
+            value_block_offsets = (
+                kv_block_numbers[:, None, None, None] * stride_key_block
+                + head_size_split_offsets[None, :, None, None] * stride_key_head_split
+                + (page_offset + block_element_offsets)[None, None, :, None]
+                * stride_key_block_elem
+                + contiguous_kv_element_offsets[None, None, None, :]
+            )
+            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+            key_tensor = _nvfp4_decode(
+                key_tensor,
+                _nvfp4_split_scales(
+                    kv_block_scale, 0, gl.SliceLayout(3, blocked_key_layout)
+                ),
+                nvfp4_lut_shared,
+                [
+                    MAX_NUM_KV_BLOCKS_PER_COMPUTE,
+                    K_HEAD_SIZE_SPLITS,
+                    KV_COMPUTE_BLOCK_SIZE,
+                    KV_16B_ELEMENT_COUNT,
+                ],
+                key_upcast_layout,
+            )
         # Reshape key tensor for matrix multiplication
         key_converted = gl.permute(key_tensor, [1, 3, 0, 2])
         key_converted = gl.reshape(
@@ -1739,7 +1905,9 @@ def paged_attention_decode_sliding_window_head_1(
         # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
         key_converted = gl.convert_layout(key_converted, layout=qk_rhs_operand_layout)
         key_converted = key_converted.to(COMPUTE_TYPE)
-        if VALUE_TRANSPOSED:
+        if KV_NVFP4:
+            pass  # Loaded before the key decode.
+        elif VALUE_TRANSPOSED:
             # Load values from transposed cache layout
             if MAX_NUM_KV_BLOCKS_PER_COMPUTE == 1:
                 kv_block_numbers_reshaped = kv_block_numbers
@@ -1771,7 +1939,6 @@ def paged_attention_decode_sliding_window_head_1(
                     + value_dim3_offsets[None, None, None, :]
                 )
             value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
         else:
@@ -1799,9 +1966,10 @@ def paged_attention_decode_sliding_window_head_1(
 
             # Permute and resape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
-        value_tensor = gl.reshape(
-            value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
-        )
+        if not KV_NVFP4:
+            value_tensor = gl.reshape(
+                value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
+            )
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
@@ -2016,10 +2184,32 @@ def paged_attention_decode_sliding_window_head_1(
         # Convert layouts for PV MFMA operation
         attention_probs = attention_probs.to(COMPUTE_TYPE)
         probs_shared.store(attention_probs)
-        values_converted = value_tensor.to(COMPUTE_TYPE)
-        values_converted = gl.convert_layout(
-            values_converted, layout=pv_rhs_operand_layout
-        )
+        if KV_NVFP4:
+            value_tensor = _nvfp4_decode(
+                value_tensor,
+                _nvfp4_split_scales(
+                    kv_block_scale, 16, gl.SliceLayout(3, blocked_key_layout)
+                ),
+                nvfp4_lut_shared,
+                [
+                    MAX_NUM_KV_BLOCKS_PER_COMPUTE,
+                    K_HEAD_SIZE_SPLITS,
+                    KV_COMPUTE_BLOCK_SIZE,
+                    KV_16B_ELEMENT_COUNT,
+                ],
+                key_upcast_layout,
+            )
+            value_tensor = gl.permute(value_tensor, [0, 2, 1, 3])
+            value_tensor = gl.reshape(
+                value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
+            )
+            value_shared.store(value_tensor.to(COMPUTE_TYPE))
+            values_converted = value_shared.load(pv_rhs_operand_layout)
+        else:
+            values_converted = value_tensor.to(COMPUTE_TYPE)
+            values_converted = gl.convert_layout(
+                values_converted, layout=pv_rhs_operand_layout
+            )
 
         accumulator_scale_expanded = gl.convert_layout(
             accumulator_scale[:, None], layout=pv_mfma_layout
@@ -2034,6 +2224,14 @@ def paged_attention_decode_sliding_window_head_1(
         probs_converted = probs_shared.load(pv_lhs_operand_layout)
         key_block_offsets2 = _amd_iglp_sched_barrier(key_block_offsets2, 0x0)
         key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
+        if KV_NVFP4:
+            kv_block_scale2 = _nvfp4_load_kv_scales(
+                kv_block_scale_ptr,
+                kv_block_numbers2,
+                page_offset + block_element_offsets,
+                stride_kv_block_scale_block,
+                gl.SliceLayout(3, blocked_key_layout),
+            )
 
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
@@ -2068,13 +2266,11 @@ def paged_attention_decode_sliding_window_head_1(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if (
-            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
-            < sequence_partition_end_idx
-        ):
-            kv_block_numbers = kv_block_numbers2
-            key_tensor = key_tensor2
-            kv_block_start_idx = kv_block_start_idx2
+        kv_block_numbers = kv_block_numbers2
+        key_tensor = key_tensor2
+        if KV_NVFP4:
+            kv_block_scale = kv_block_scale2
+        kv_block_start_idx = kv_block_start_idx2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
@@ -3054,14 +3250,10 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if (
-            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
-            < sequence_partition_end_idx
-        ):
-            kv_block_numbers = kv_block_numbers2
-            key_tensor = key_tensor2
-            kv_block_start_idx = kv_block_start_idx2
-            page_offset = page_offset2
+        kv_block_numbers = kv_block_numbers2
+        key_tensor = key_tensor2
+        kv_block_start_idx = kv_block_start_idx2
+        page_offset = page_offset2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
@@ -4265,6 +4457,16 @@ def paged_attention_decode_v2_reduce_kernel(
     )
 
 
+@lru_cache(maxsize=None)
+def _nvfp4_lut(device):
+    """[256] int64 bytes E4M3(|E2M1| * scale) for each E4M3 scale byte."""
+    fp8 = torch.float8_e4m3fn
+    scale = torch.arange(256, dtype=torch.uint8).view(fp8).float().nan_to_num(0.0)
+    e2m1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    lut = (e2m1[None, :] * scale[:, None]).clamp(-448, 448).to(fp8)
+    return lut.view(torch.uint8).contiguous().view(torch.int64)[:, 0].to(device)
+
+
 def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     grid,
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -4319,6 +4521,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     sinks_ptr,
     PS,
     CDNA_VERSION,
+    kv_block_scale=None,
 ):
     """
     Wrapper function for paged attention decode kernel with dynamic kernel selection.
@@ -4341,8 +4544,16 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
     if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
         ONE_SHOT = num_splits <= 1
+        extra_kwargs = {}
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
+            if kv_block_scale is not None:
+                extra_kwargs.update(
+                    kv_block_scale_ptr=kv_block_scale,
+                    stride_kv_block_scale_block=kv_block_scale.stride(0),
+                    nvfp4_lut_ptr=_nvfp4_lut(kv_block_scale.device),
+                    KV_NVFP4=True,
+                )
             if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
                 grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
                 QUERY_SEQ_LEN_POW2 = 1
@@ -4354,6 +4565,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 grid = (num_sequences, mtp_splits, num_splits)
                 QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
+            assert kv_block_scale is None, "NVFP4 KV needs one KV head"
             paged_attention_kernel = paged_attention_decode_sliding_window
         paged_attention_kernel[grid](
             exp_sums_ptr,
@@ -4412,9 +4624,11 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
             CDNA_VERSION=CDNA_VERSION,
             ONE_SHOT=ONE_SHOT,
+            **extra_kwargs,
         )
         return
 
+    assert kv_block_scale is None, "NVFP4 KV needs the PS path"
     if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
         # Use big block kernel for large block sizes
         paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_dot_kernel
@@ -4665,6 +4879,7 @@ def pa_decode_gluon(
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     ps: bool = True,
+    kv_block_scale: torch.Tensor = None,  # [num_blocks, 1, kv_block_size, head_size // 32, 4]
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -4765,6 +4980,14 @@ def pa_decode_gluon(
         - Dtype: torch.float32
         - Default: None (no ALiBi)
 
+    kv_block_scale : torch.Tensor, optional
+        NVFP4 KV cache: E4M3 scales (as uint8) of 16 head_size elements per
+        token, byte [..., s, j] holding split s + 4 * (j % 2) of the key
+        (j < 2) or value (j >= 2). key_cache and value_cache are then uint8
+        [num_blocks, 1, head_size // 16, kv_block_size, 8] holding E2M1 codes
+        in the byte order of _NVFP4_DECODE_ASM. key_scale/value_scale stay
+        per-tensor.
+
     Returns
     -------
     None
@@ -4802,8 +5025,9 @@ def pa_decode_gluon(
 
     # Determine if causal masking is needed
     is_causal = query_length > 1
+    kv_nvfp4 = kv_block_scale is not None
     # Calculate elements per 16B load based on data type
-    kv_elements_per_16b = 16 // key_cache.dtype.itemsize
+    kv_elements_per_16b = 16 if kv_nvfp4 else 16 // key_cache.dtype.itemsize
 
     # if sliding_window > 0 and kv_block_size != 1024:
     #     max_context_partition_num = 1
@@ -4816,12 +5040,20 @@ def pa_decode_gluon(
         aiter.dtypes.bf16,
         aiter.dtypes.fp16,
     ], f"query tensor only support dtype in [{aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16}], but got query.dtype == {query.dtype}"
-    assert key_cache.dtype in [
+    if kv_nvfp4:
+        assert key_cache.dtype == value_cache.dtype == torch.uint8
+        assert kv_block_scale.dtype == torch.uint8
+        assert kv_block_scale.shape[2:] == (kv_block_size, head_size // 32, 4)
+        assert key_cache.stride() == value_cache.stride()
+        key_cache = key_cache.view(torch.int32)
+        value_cache = value_cache.view(torch.int32)
+        kv_block_scale = kv_block_scale.view(torch.int32)
+    assert kv_nvfp4 or key_cache.dtype in [
         aiter.dtypes.fp8,
         aiter.dtypes.bf16,
         aiter.dtypes.fp16,
     ], f"key_cache tensor only support dtype in [{aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16}], but got key_cache.dtype == {key_cache.dtype}"
-    assert value_cache.dtype in [
+    assert kv_nvfp4 or value_cache.dtype in [
         aiter.dtypes.fp8,
         aiter.dtypes.bf16,
         aiter.dtypes.fp16,
@@ -4917,7 +5149,7 @@ def pa_decode_gluon(
     if (
         key_scale is not None
         and value_scale is not None
-        and key_cache.dtype == aiter.dtypes.fp8
+        and (key_cache.dtype == aiter.dtypes.fp8 or kv_nvfp4)
     ):
         assert (
             isinstance(key_scale, torch.Tensor) and key_scale.dtype == aiter.dtypes.fp32
@@ -4958,7 +5190,7 @@ def pa_decode_gluon(
 
     # ==================== FP8 CONFIGURATION ====================
     fp8_max_value = 1.0
-    if value_cache.dtype == aiter.dtypes.fp8:
+    if value_cache.dtype == aiter.dtypes.fp8 or kv_nvfp4:
         fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
 
     # Reshape query to 5D for direct read access
@@ -5027,6 +5259,7 @@ def pa_decode_gluon(
         sinks_ptr=sinks,
         PS=ps,
         CDNA_VERSION=cdna_version,
+        kv_block_scale=kv_block_scale,
     )
     # output is already reshaped via output_5d view
     if not one_shot:
