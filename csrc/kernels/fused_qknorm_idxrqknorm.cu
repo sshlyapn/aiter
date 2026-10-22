@@ -22,15 +22,79 @@ namespace fused_qknorm_idxrqknorm_ops {
 constexpr int kHeadDim = 128;
 constexpr int kNumLanes = 32;
 constexpr int kElemsPerLane = kHeadDim / kNumLanes;
+// One wave per block, grid (token, slot pair): the token is block-uniform.
+// Measured faster than multi-wave blocks at large token counts.
+constexpr int kBlockSize = 64;
+constexpr int kSlotsPerBlock = kBlockSize / kNumLanes;
 
+// DPP lane moves inside a row of 16 lanes (all lanes of the row active).
+constexpr int kDppQuadXor1 = 0xB1; // quad_perm [1, 0, 3, 2]
+constexpr int kDppQuadXor2 = 0x4E; // quad_perm [2, 3, 0, 1]
+constexpr int kDppRowRor4  = 0x124;
+constexpr int kDppRowRor8  = 0x128;
+
+template <int kCtrl>
+__device__ __forceinline__ float dppMov(float v)
+{
+    return __int_as_float(
+        __builtin_amdgcn_update_dpp(0, __float_as_int(v), kCtrl, 0xF, 0xF, false));
+}
+
+template <int kCtrl>
+__device__ __forceinline__ uint32_t dppMov(uint32_t v)
+{
+    return static_cast<uint32_t>(
+        __builtin_amdgcn_update_dpp(0, static_cast<int>(v), kCtrl, 0xF, 0xF, false));
+}
+
+// val + __shfl_xor(val, 16, 32), without LDS on gfx950.
+__device__ __forceinline__ float addXor16(float val)
+{
+#if defined(__gfx950__)
+    const auto r = __builtin_amdgcn_permlane16_swap(
+        __float_as_uint(val), __float_as_uint(val), false, false);
+    return __uint_as_float(r[0]) + __uint_as_float(r[1]);
+#else
+    return val + __shfl_xor(val, 16, 32);
+#endif
+}
+
+// Same butterfly (xor 16, 8, 4, 2, 1 within 32 lanes) as a __shfl_xor loop, so
+// the result is bit-identical. Lanes are symmetric under xor 8 after the xor-8
+// step, which makes row_ror:4 equal to xor 4. All 32 lanes must be active.
 __device__ __forceinline__ float warpReduceSum(float val)
 {
-#pragma unroll
-    for(int mask = 16; mask > 0; mask >>= 1)
-    {
-        val += __shfl_xor(val, mask, 32);
-    }
+    val = addXor16(val);
+    val += dppMov<kDppRowRor8>(val);
+    val += dppMov<kDppRowRor4>(val);
+    val += dppMov<kDppQuadXor2>(val);
+    val += dppMov<kDppQuadXor1>(val);
     return val;
+}
+
+// float -> 16-bit pattern of scalar_t; hip_bfloat16's rounding without branches.
+template <typename scalar_t>
+__device__ __forceinline__ uint32_t toBits(float f)
+{
+    if constexpr(std::is_same_v<scalar_t, hip_bfloat16>)
+    {
+        // Both results computed up front so the choice stays a select.
+        const uint32_t u = __float_as_uint(f);
+        const uint32_t rne = u + 0x7fffu + ((u >> 16) & 1u);
+        const uint32_t inf_nan = u | ((u & 0xffffu) ? 0x10000u : 0u);
+        return ((~u & 0x7f800000u) ? rne : inf_nan) >> 16;
+    }
+    else
+    {
+        static_assert(sizeof(scalar_t) == 2);
+        return __builtin_bit_cast(uint16_t, static_cast<scalar_t>(f));
+    }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ float fromBits(uint32_t b)
+{
+    return static_cast<float>(__builtin_bit_cast(scalar_t, static_cast<uint16_t>(b)));
 }
 
 __device__ __forceinline__ float warpReduceMax(float val)
@@ -64,15 +128,30 @@ __device__ __forceinline__ void loadElems(const scalar_t* __restrict__ src,
     }
 }
 
+// Element i of the kElemsPerLane 16-bit values a lane holds in one 8-byte word.
+__device__ __forceinline__ uint32_t rawElem(const uint2& raw, int i)
+{
+    return ((i < 2 ? raw.x : raw.y) >> (16 * (i % 2))) & 0xffffu;
+}
+
 template <typename scalar_t>
-__device__ __forceinline__ void storeElems(scalar_t* __restrict__ dst,
-                                           const float (&elems)[kElemsPerLane])
+__device__ __forceinline__ void unpackElems(const uint2& raw, float (&elems)[kElemsPerLane])
 {
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        dst[i] = static_cast<scalar_t>(elems[i]);
+        elems[i] = fromBits<scalar_t>(rawElem(raw, i));
     }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void storeElems(scalar_t* __restrict__ dst,
+                                           const float (&elems)[kElemsPerLane])
+{
+    uint2 packed;
+    packed.x = toBits<scalar_t>(elems[0]) | toBits<scalar_t>(elems[1]) << 16;
+    packed.y = toBits<scalar_t>(elems[2]) | toBits<scalar_t>(elems[3]) << 16;
+    *reinterpret_cast<uint2*>(dst) = packed;
 }
 
 template <typename scalar_t>
@@ -81,7 +160,51 @@ __device__ __forceinline__ void roundElems(float (&elems)[kElemsPerLane])
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        elems[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
+        elems[i] = fromBits<scalar_t>(toBits<scalar_t>(elems[i]));
+    }
+}
+
+// page = slot / block, tok = slot % block for slot >= 0. Power-of-two blocks
+// (the usual case) skip the 64-bit division.
+__device__ __forceinline__ void splitSlot(int64_t slot, int block, int64_t& page, int64_t& tok)
+{
+    if((block & (block - 1)) == 0)
+    {
+        page = slot >> __builtin_ctz(block);
+        tok = slot & (block - 1);
+    }
+    else
+    {
+        page = slot / block;
+        tok = slot % block;
+    }
+}
+
+// out = in / scale. For scale = +-2^k with a normal reciprocal (e.g. the usual
+// 1.0), in * 2^-k is the same correctly rounded value, which skips the IEEE
+// division sequence. scale is uniform in practice, so the branch is too.
+__device__ __forceinline__ void divElemsByScale(const float (&in)[kElemsPerLane],
+                                                float scale,
+                                                float (&out)[kElemsPerLane])
+{
+    const uint32_t bits = __float_as_uint(scale);
+    const uint32_t e    = (bits >> 23) & 0xffu;
+    if((bits & 0x7fffffu) == 0 && e >= 1 && e <= 253)
+    {
+        const float inv = __uint_as_float((bits & 0x80000000u) | ((254u - e) << 23));
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            out[i] = in[i] * inv;
+        }
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            out[i] = in[i] / scale;
+        }
     }
 }
 
@@ -97,18 +220,60 @@ __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
                                                 const float (&elems)[kElemsPerLane],
                                                 float scale)
 {
-#pragma unroll
-    for(int i = 0; i < kElemsPerLane; ++i)
+    if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
     {
-        if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
         {
             dst[i] = static_cast<cache_t>(elems[i]);
         }
-        else
+    }
+    else
+    {
+        float scaled[kElemsPerLane];
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
         {
-            const scalar_t rounded = static_cast<scalar_t>(elems[i]);
-            dst[i] = opus::cast<cache_t>(static_cast<float>(rounded) / scale);
+            scaled[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
         }
+        divElemsByScale(scaled, scale, scaled);
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            dst[i] = opus::cast<cache_t>(scaled[i]);
+        }
+    }
+}
+
+// storeCacheElems as one store; dst must be aligned to the whole run.
+template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
+__device__ __forceinline__ void storeCacheElemsPacked(cache_t* __restrict__ dst,
+                                                      const float (&elems)[kElemsPerLane],
+                                                      float scale)
+{
+    if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+    {
+        static_assert(std::is_same_v<cache_t, scalar_t>);
+        storeElems(dst, elems);
+    }
+    else
+    {
+        static_assert(sizeof(cache_t) == 1);
+        float scaled[kElemsPerLane];
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            scaled[i] = fromBits<scalar_t>(toBits<scalar_t>(elems[i]));
+        }
+        divElemsByScale(scaled, scale, scaled);
+        uint32_t packed = 0;
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            const cache_t q = opus::cast<cache_t>(scaled[i]);
+            packed |= static_cast<uint32_t>(__builtin_bit_cast(uint8_t, q)) << (8 * i);
+        }
+        *reinterpret_cast<uint32_t*>(dst) = packed;
     }
 }
 
@@ -128,7 +293,7 @@ __device__ __forceinline__ void storeIndexQElems(scalar_t* __restrict__ index_q_
                         static_cast<int64_t>(iq_head) * kHeadDim + dim_base;
     if(index_q_fp8_out != nullptr)
     {
-        storeCacheElems<scalar_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3>(
+        storeCacheElemsPacked<scalar_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3>(
             index_q_fp8_out + off, elems, 1.0f);
     }
     else if(index_q_out != nullptr)
@@ -160,24 +325,32 @@ __device__ __forceinline__ void copyOrQuantizeCacheElems(const scalar_t* __restr
 
 // Strided V store for the SHUFFLE (asm) layout: the kElemsPerLane elements owned
 // by a lane are `stride` apart in the destination cache (V layout interleaves the
-// intra-page position x-remainder between consecutive head-dim elements). Source
-// is the raw (no norm/rope) qkv row, contiguous.
+// intra-page position x-remainder between consecutive head-dim elements). raw /
+// elems are the lane's raw (no norm/rope) qkv values.
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
-__device__ __forceinline__ void storeCacheElemsStrided(const scalar_t* __restrict__ src,
+__device__ __forceinline__ void storeCacheElemsStrided(const uint2& raw,
+                                                       const float (&elems)[kElemsPerLane],
                                                        cache_t* __restrict__ dst,
                                                        int64_t stride,
                                                        float scale)
 {
-#pragma unroll
-    for(int i = 0; i < kElemsPerLane; ++i)
+    if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
     {
-        if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
         {
-            dst[i * stride] = static_cast<cache_t>(src[i]);
+            dst[i * stride] =
+                __builtin_bit_cast(cache_t, static_cast<uint16_t>(rawElem(raw, i)));
         }
-        else
+    }
+    else
+    {
+        float scaled[kElemsPerLane];
+        divElemsByScale(elems, scale, scaled);
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
         {
-            dst[i * stride] = opus::cast<cache_t>(static_cast<float>(src[i]) / scale);
+            dst[i * stride] = opus::cast<cache_t>(scaled[i]);
         }
     }
 }
@@ -237,8 +410,8 @@ __device__ __forceinline__ void storeKvNvfp4(const float (&elems)[kElemsPerLane]
         a[i] = has_scale ? __fdiv_rn(elems[i], scale) : elems[i];
         amax = fmaxf(amax, fabsf(a[i]));
     }
-    amax = fmaxf(amax, __shfl_xor(amax, 1, 32));
-    amax = fmaxf(amax, __shfl_xor(amax, 2, 32));
+    amax = fmaxf(amax, dppMov<kDppQuadXor1>(amax));
+    amax = fmaxf(amax, dppMov<kDppQuadXor2>(amax));
     const float sf_raw = fminf(__fdiv_rn(fmaxf(amax, 1e-12f), 6.0f), 448.0f);
     const uint32_t sf8 = e4m3RnePositive(fmaxf(e4m3ToFloat(e4m3RnePositive(sf_raw)),
                                                1.0f / 512.0f));
@@ -264,7 +437,7 @@ __device__ __forceinline__ void storeKvNvfp4(const float (&elems)[kElemsPerLane]
     {
         part |= (b_sign << 8) | (b_sign >> 24);
     }
-    part |= __shfl_xor(part, 1, 32);
+    part |= dppMov<kDppQuadXor1>(part);
 
     const int s = lane_id / 4;
     if(!is_b)
@@ -293,16 +466,17 @@ __device__ __forceinline__ void storeIndexNvfp4(const float (&elems)[kElemsPerLa
                                                 int64_t s_page,
                                                 int block)
 {
-    const int64_t page = slot / block;
-    const int tok = static_cast<int>(slot - page * block);
+    int64_t page, tok64;
+    splitSlot(slot, block, page, tok64);
+    const int tok = static_cast<int>(tok64);
     float amax = 0.0f;
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
         amax = fmaxf(amax, fabsf(elems[i]));
     }
-    amax = fmaxf(amax, __shfl_xor(amax, 1, 32));
-    amax = fmaxf(amax, __shfl_xor(amax, 2, 32));
+    amax = fmaxf(amax, dppMov<kDppQuadXor1>(amax));
+    amax = fmaxf(amax, dppMov<kDppQuadXor2>(amax));
     const uint32_t s8 =
         e4m3RnePositive(fminf(fmaxf(__fdiv_rn(amax, 6.0f), 1.0f / 512.0f), 448.0f));
     const float s = e4m3ToFloat(s8);
@@ -317,8 +491,8 @@ __device__ __forceinline__ void storeIndexNvfp4(const float (&elems)[kElemsPerLa
     }
     uint8_t* base = cache + page * s_page;
     uint8_t* codes = base + tok * (kHeadDim / 2) + lane_id * 2;
-    codes[0] = static_cast<uint8_t>(nib[0] | nib[1] << 4);
-    codes[1] = static_cast<uint8_t>(nib[2] | nib[3] << 4);
+    *reinterpret_cast<uint16_t*>(codes) =
+        static_cast<uint16_t>(nib[0] | nib[1] << 4 | nib[2] << 8 | nib[3] << 12);
     if(lane_id % 4 == 0)
     {
         base[block * (kHeadDim / 2) + tok * (kHeadDim / 16) + lane_id / 4] =
@@ -326,58 +500,73 @@ __device__ __forceinline__ void storeIndexNvfp4(const float (&elems)[kElemsPerLa
     }
 }
 
+// weight / cos / sin are the lane's raw values (loaded up front by the caller);
+// cos / sin only matter on rope lanes. Every lane computes norm and rope and
+// keeps the result by select: branch-free code keeps the caller's loads from
+// being sunk past (and serialized behind) branches.
 template <typename scalar_t>
-__device__ __forceinline__ void normAndRope(
-    float (&elems)[kElemsPerLane],
-    int lane_id,
-    float eps,
-    const scalar_t* __restrict__ weight,
-    bool do_rope,
-    int rotary_dim,
-    const scalar_t* __restrict__ cos_ptr,
-    bool apply_norm)
+__device__ __forceinline__ void normAndRope(float (&elems)[kElemsPerLane],
+                                            int lane_id,
+                                            float eps,
+                                            const uint2& weight,
+                                            bool do_rope,
+                                            int rotary_dim,
+                                            const uint2& cos,
+                                            const uint2& sin,
+                                            bool apply_norm)
 {
-    if(apply_norm)
+    float sumsq = 0.0f;
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
     {
-        float sumsq = 0.0f;
+        sumsq += elems[i] * elems[i];
+    }
+    sumsq = warpReduceSum(sumsq);
+    const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        const float normed =
+            elems[i] * rms_rcp * (1.0f + fromBits<scalar_t>(rawElem(weight, i)));
+        elems[i] = apply_norm ? normed : elems[i];
+    }
+
+    const int half = rotary_dim / 2;
+    const int dim0 = lane_id * kElemsPerLane;
+    const bool in_rope = do_rope && dim0 < rotary_dim;
+    const bool first_half = dim0 < half;
+
+    // Partner lane is lane +- half / kElemsPerLane; xor 8 inside a DPP row
+    // for rotary_dim 64.
+    float partner[kElemsPerLane];
+    if(rotary_dim == 2 * 8 * kElemsPerLane)
+    {
 #pragma unroll
         for(int i = 0; i < kElemsPerLane; ++i)
         {
-            sumsq += elems[i] * elems[i];
+            partner[i] = dppMov<kDppRowRor8>(elems[i]);
         }
-        sumsq = warpReduceSum(sumsq);
-        const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+    }
+    else
+    {
+        const int partner_lane = dim0 >= rotary_dim ? lane_id
+                                 : first_half       ? (dim0 + half) / kElemsPerLane
+                                                    : (dim0 - half) / kElemsPerLane;
 #pragma unroll
         for(int i = 0; i < kElemsPerLane; ++i)
         {
-            const int dim = lane_id * kElemsPerLane + i;
-            elems[i] = elems[i] * rms_rcp * (1.0f + static_cast<float>(weight[dim]));
+            partner[i] = __shfl(elems[i], partner_lane, 32);
         }
     }
 
-    if(do_rope)
-    {
-        const int half = rotary_dim / 2;
-        const int dim0 = lane_id * kElemsPerLane;
-        const bool in_rope = dim0 < rotary_dim;
-
-        if(in_rope)
-        {
-            const bool first_half = dim0 < half;
-            const int i_base = first_half ? dim0 : dim0 - half;
-            const int partner_lane = first_half ? (dim0 + half) / kElemsPerLane
-                                                : (dim0 - half) / kElemsPerLane;
-            const scalar_t* sin_ptr = cos_ptr + half;
 #pragma unroll
-            for(int i = 0; i < kElemsPerLane; ++i)
-            {
-                const float c = static_cast<float>(cos_ptr[i_base + i]);
-                const float s = static_cast<float>(sin_ptr[i_base + i]);
-                const float partner = __shfl(elems[i], partner_lane, 32);
-                elems[i] = first_half ? elems[i] * c - partner * s
-                                      : elems[i] * c + partner * s;
-            }
-        }
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        const float c = fromBits<scalar_t>(rawElem(cos, i));
+        const float s = fromBits<scalar_t>(rawElem(sin, i));
+        const float roped = first_half ? elems[i] * c - partner[i] * s
+                                       : elems[i] * c + partner[i] * s;
+        elems[i] = in_rope ? roped : elems[i];
     }
 }
 
@@ -394,22 +583,21 @@ template <typename scalar_t,
           bool kAsmLayout,
           bool kKvNvfp4,
           bool kIdxNvfp4>
-__global__ void fusedQKNormIdxrQKNormKernel(
+__global__ __launch_bounds__(kBlockSize) void fusedQKNormIdxrQKNormKernel(
+    // The leading 14 dwords are preloaded into SGPRs and the next ones are read
+    // together: the arguments the first loads depend on go first.
+    const int64_t* __restrict__ positions,
+    const scalar_t* __restrict__ cos_sin_cache,
     scalar_t* __restrict__ qkv,
-    scalar_t* __restrict__ q_out,
-    scalar_t* __restrict__ index_q_out,
-    opus::fp8_t* __restrict__ index_q_fp8_out,
+    int nq,
+    int nkv,
+    int niq,
+    int rotary_dim,
     const scalar_t* __restrict__ q_norm_w,
     const scalar_t* __restrict__ k_norm_w,
+    scalar_t* __restrict__ q_out,
     const scalar_t* __restrict__ iq_norm_w,
     const scalar_t* __restrict__ ik_norm_w,
-    const scalar_t* __restrict__ cos_sin_cache,
-    const int64_t* __restrict__ positions,
-    const int64_t* __restrict__ slot_mapping,
-    const int64_t* __restrict__ index_slot_mapping,
-    cache_t* __restrict__ kv_cache_k,
-    cache_t* __restrict__ kv_cache_v,
-    index_cache_t* __restrict__ index_cache,
     // Per-token dynamic-quant OUTPUT dequant scales (fp8 per-token path only).
     // Null for the SGLang unit-scale fp8 contract. Layout mirrors
     // reshape_and_cache_with_pertoken_quant:
@@ -419,15 +607,17 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     //     idx = head*max_kv_tokens + slot
     float* __restrict__ k_scale,
     float* __restrict__ v_scale,
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t* __restrict__ index_slot_mapping,
     float eps,
-    int rotary_dim,
-    int num_tokens,
-    int nq,
-    int nkv,
-    int niq,
     int block_size,
     int x,
     int max_kv_tokens,
+    scalar_t* __restrict__ index_q_out,
+    opus::fp8_t* __restrict__ index_q_fp8_out,
+    cache_t* __restrict__ kv_cache_k,
+    cache_t* __restrict__ kv_cache_v,
+    index_cache_t* __restrict__ index_cache,
     // page-128 (asm_layout=false) strides for the separate K/V caches
     // (each [num_blocks, block_size, num_kv_heads, head_dim]); unused when kAsmLayout.
     // NVFP4 K/V: byte strides of a page-16 page (block) and of a head.
@@ -441,125 +631,125 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int idx_block,
     int64_t idx_s_page)
 {
-    const int warps_per_block = blockDim.x / 32;
-    const int lane_id = threadIdx.x % 32;
-    const int global_warp_idx = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    // grid = (num_tokens, slot pairs): the token is block-uniform, so its
+    // per-token loads are scalar. blockDim.x would be a dependent load.
+    const int lane_id = threadIdx.x % kNumLanes;
+    const int token_idx = blockIdx.x;
+    const int slot = blockIdx.y * kSlotsPerBlock + threadIdx.x / kNumLanes;
 
-    const int v_slots = kInsertKV ? nkv : 0;
-    const int idx_slots = kProcessIndex ? niq + 1 : 0;
-    const int slots_per_token = nq + nkv + v_slots + idx_slots;
-    const int token_idx = global_warp_idx / slots_per_token;
-    const int slot = global_warp_idx % slots_per_token;
-    if(token_idx >= num_tokens)
-    {
-        return;
-    }
-
-    const int k_begin = nq;
-    const int v_begin = nq + nkv;
-    const int iq_begin = nq + nkv + v_slots;
-    const int ik_slot = iq_begin + niq;
-    const bool is_q = slot < k_begin;
-    const bool is_k = slot >= k_begin && slot < v_begin;
-    bool is_v = false;
+    const int64_t pos = positions[token_idx];
+    int64_t kv_slot = -1;
+    int64_t idx_slot = -1;
     if constexpr(kInsertKV)
     {
-        is_v = slot >= v_begin && slot < v_begin + nkv;
-    }
-    bool is_iq = false;
-    bool is_ik = false;
-    if constexpr(kProcessIndex)
-    {
-        is_iq = slot >= iq_begin && slot < ik_slot;
-        is_ik = slot == ik_slot;
-    }
-
-    // NVFP4 K/V scale, read before the dependent row loads.
-    bool has_kv_scale = false;
-    float kv_scale_val = 1.0f;
-    if constexpr(kKvNvfp4)
-    {
-        has_kv_scale = k_scale != nullptr;
-        if(has_kv_scale && (is_k || is_v))
-        {
-            kv_scale_val = is_v ? *v_scale : *k_scale;
-        }
-    }
-
-    const int dim_base = lane_id * kElemsPerLane;
-    const int qkv_row = (nq + 2 * nkv + (kIsSparse ? (niq + 1) : 0)) * kHeadDim;
-
-    scalar_t* row_ptr = nullptr;
-    const scalar_t* norm_w = nullptr;
-    bool do_rope = true;
-    int head = 0;
-
-    if(is_q)
-    {
-        row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + slot * kHeadDim;
-        norm_w = q_norm_w;
-    }
-    else if(is_k)
-    {
-        head = slot - k_begin;
-        row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + slot * kHeadDim;
-        norm_w = k_norm_w;
-    }
-    else if(is_v)
-    {
-        head = slot - v_begin;
-        row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + slot * kHeadDim;
-        do_rope = false;
-    }
-    else if constexpr(kProcessIndex)
-    {
-        if(is_iq)
-        {
-            const int ih = slot - iq_begin;
-            row_ptr =
-                qkv + static_cast<int64_t>(token_idx) * qkv_row +
-                (nq + 2 * nkv + ih) * kHeadDim;
-            norm_w = iq_norm_w;
-        }
-        else
-        {
-            row_ptr =
-                qkv + static_cast<int64_t>(token_idx) * qkv_row +
-                (nq + 2 * nkv + niq) * kHeadDim;
-            norm_w = ik_norm_w;
-        }
-    }
-
-    scalar_t* store_ptr = row_ptr;
-    if(is_q && q_out != nullptr)
-    {
-        store_ptr = q_out + static_cast<int64_t>(token_idx) * nq * kHeadDim + slot * kHeadDim;
-    }
-
-    int64_t mapped_slot = -1;
-    if constexpr(kInsertKV)
-    {
+        kv_slot = slot_mapping[token_idx];
         if constexpr(kProcessIndex)
         {
-            mapped_slot = is_ik ? index_slot_mapping[token_idx]
-                                : ((is_k || is_v) ? slot_mapping[token_idx] : -1);
-        }
-        else
-        {
-            mapped_slot = (is_k || is_v) ? slot_mapping[token_idx] : -1;
+            idx_slot = index_slot_mapping[token_idx];
         }
     }
 
-    if constexpr(kInsertKV)
-    {
-        if(is_v)
+    // kQOnly: every slot of the block is a q head (most blocks), so the K / V /
+    // index paths drop out of that copy of the code.
+    const auto process = [=](auto q_only) __attribute__((always_inline)) {
+        constexpr bool kQOnly = decltype(q_only)::value;
+
+        const int v_slots = kInsertKV ? nkv : 0;
+        const int idx_slots = kProcessIndex ? niq + 1 : 0;
+        const int slots_per_token = nq + nkv + v_slots + idx_slots;
+        if(slot >= slots_per_token)
         {
-            if constexpr(kKvNvfp4)
+            return;
+        }
+
+        const int k_begin = nq;
+        const int v_begin = nq + nkv;
+        const int iq_begin = nq + nkv + v_slots;
+        const int ik_slot = iq_begin + niq;
+        const bool is_q = kQOnly || slot < k_begin;
+        const bool is_k = !kQOnly && slot >= k_begin && slot < v_begin;
+        bool is_v = false;
+        if constexpr(kInsertKV && !kQOnly)
+        {
+            is_v = slot >= v_begin && slot < v_begin + nkv;
+        }
+        bool is_iq = false;
+        bool is_ik = false;
+        if constexpr(kProcessIndex && !kQOnly)
+        {
+            is_iq = slot >= iq_begin && slot < ik_slot;
+            is_ik = slot == ik_slot;
+        }
+
+        const int dim_base = lane_id * kElemsPerLane;
+        const int qkv_row = (nq + 2 * nkv + (kIsSparse ? (niq + 1) : 0)) * kHeadDim;
+
+        // Slots and qkv heads line up except without V slots, where the index
+        // heads sit nkv heads further.
+        const int qkv_head = (kInsertKV || slot < v_begin) ? slot : slot + nkv;
+        scalar_t* row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + qkv_head * kHeadDim;
+        const scalar_t* norm_w = is_q    ? q_norm_w
+                                 : is_k  ? k_norm_w
+                                 : is_iq ? iq_norm_w
+                                 : is_ik ? ik_norm_w
+                                         : nullptr;
+        const bool do_rope = !is_v;
+        const int head = slot - (is_v ? v_begin : k_begin);
+
+        // Issue every global load before any wait.
+        const uint2 raw = *reinterpret_cast<const uint2*>(row_ptr + dim_base);
+        const uint2 w_raw =
+            *reinterpret_cast<const uint2*>((norm_w != nullptr ? norm_w : q_norm_w) + dim_base);
+
+        const int64_t mapped_slot = is_ik ? idx_slot : ((is_k || is_v) ? kv_slot : -1);
+
+        // NVFP4 or static fp8 K/V scale. A per-lane load, so waits on the scalar
+        // loads above do not also wait for it.
+        bool has_kv_scale = false;
+        float kv_scale_val = 1.0f;
+        if constexpr(kKvNvfp4 || kStaticKVScale)
+        {
+            // k_scale / v_scale are both set or both null (host check); testing
+            // the selected one keeps the v_scale argument read out of the branch.
+            const float* scale_ptr = is_v ? v_scale : k_scale;
+            has_kv_scale = kStaticKVScale || scale_ptr != nullptr;
+            if(has_kv_scale)
             {
-                // Stored with K below: one store site keeps the scale byte
-                // store from waiting on the code store.
+                kv_scale_val = *scale_ptr;
             }
-            else if(mapped_slot >= 0)
+        }
+
+        // cos / sin of the lane's rope dims; lanes outside the rope read dim 0.
+        const int half_rot = rotary_dim / 2;
+        const int rope_base =
+            dim_base < rotary_dim ? (dim_base < half_rot ? dim_base : dim_base - half_rot) : 0;
+        const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim + rope_base;
+        const uint2 cos_raw = *reinterpret_cast<const uint2*>(cos_ptr);
+        const uint2 sin_raw = *reinterpret_cast<const uint2*>(cos_ptr + half_rot);
+
+        scalar_t* store_ptr = row_ptr;
+        if(is_q && q_out != nullptr)
+        {
+            store_ptr = q_out + static_cast<int64_t>(token_idx) * nq * kHeadDim + slot * kHeadDim;
+        }
+
+        float elems[kElemsPerLane];
+        unpackElems<scalar_t>(raw, elems);
+
+        normAndRope<scalar_t>(elems,
+                              lane_id,
+                              eps,
+                              w_raw,
+                              do_rope,
+                              rotary_dim,
+                              cos_raw,
+                              sin_raw,
+                              norm_w != nullptr);
+
+        if constexpr(kInsertKV && !kKvNvfp4)
+        {
+            // V: the raw elems (normAndRope leaves them unchanged on V lanes).
+            if(is_v && mapped_slot >= 0)
             {
                 // Per-token dynamic quant: amax over the lane's raw V elems, then a
                 // full-warp max -> the (token, head) head-dim amax. scale = amax/FP8_MAX.
@@ -568,18 +758,17 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                              kPerTokenKVScale)
                 {
                     float local_amax = 0.0f;
-#pragma unroll
+    #pragma unroll
                     for(int i = 0; i < kElemsPerLane; ++i)
                     {
-                        local_amax = fmaxf(local_amax,
-                                           fabsf(static_cast<float>(row_ptr[dim_base + i])));
+                        local_amax = fmaxf(local_amax, fabsf(elems[i]));
                     }
                     const float amax = warpReduceMax(local_amax);
                     v_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
                     if(lane_id == 0)
                     {
-                        const int64_t b = mapped_slot / block_size;
-                        const int64_t t = mapped_slot % block_size;
+                        int64_t b, t;
+                        splitSlot(mapped_slot, block_size, b, t);
                         const int64_t scale_idx =
                             kAsmLayout
                                 ? (b * (static_cast<int64_t>(nkv) * block_size) +
@@ -590,189 +779,191 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                 }
                 else if constexpr(kStaticKVScale)
                 {
-                    v_scale_val = *v_scale;
+                    v_scale_val = kv_scale_val;
                 }
                 if constexpr(kAsmLayout)
                 {
                     // V SHUFFLE: [num_blocks, num_kv_heads, block_size/x, head_dim, x]
                     //   off(d) = b*(nkv*hd*bs) + h*(hd*bs) + (t/x)*(hd*x) + d*x + (t%x)
                     // The kElemsPerLane elements of a lane (consecutive d) are x apart.
-                    const int64_t b = mapped_slot / block_size;
-                    const int64_t t = mapped_slot % block_size;
+                    int64_t b, t;
+                    splitSlot(mapped_slot, block_size, b, t);
+                    int64_t t_hi, t_lo;
+                    splitSlot(t, x, t_hi, t_lo);
                     const int64_t v_base =
                         b * (static_cast<int64_t>(nkv) * kHeadDim * block_size) +
                         static_cast<int64_t>(head) * kHeadDim * block_size +
-                        (t / x) * (static_cast<int64_t>(kHeadDim) * x) +
-                        static_cast<int64_t>(dim_base) * x + (t % x);
+                        t_hi * (static_cast<int64_t>(kHeadDim) * x) +
+                        static_cast<int64_t>(dim_base) * x + t_lo;
                     storeCacheElemsStrided<scalar_t, cache_t, kv_dt>(
-                        row_ptr + dim_base, kv_cache_v + v_base, x, v_scale_val);
+                        raw, elems, kv_cache_v + v_base, x, v_scale_val);
                 }
                 else
                 {
                     // page-128 V cache [num_blocks, block_size, num_kv_heads, head_dim]
-                    const int64_t b = mapped_slot / block_size;
-                    const int64_t t = mapped_slot % block_size;
+                    int64_t b, t;
+                    splitSlot(mapped_slot, block_size, b, t);
                     const int64_t off =
                         b * v_s_block + t * v_s_token + head * v_s_head;
                     copyOrQuantizeCacheElems<scalar_t, cache_t, kv_dt>(
                         row_ptr + dim_base, kv_cache_v + off + dim_base, v_scale_val);
                 }
             }
-            if constexpr(!kKvNvfp4)
+        }
+
+        if constexpr(kInsertKV)
+        {
+            if(is_q)
             {
-                return;
+                storeElems(store_ptr + dim_base, elems);
             }
-        }
-    }
-
-    float elems[kElemsPerLane];
-    loadElems(row_ptr + dim_base, elems);
-    const int64_t pos = positions[token_idx];
-    const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim;
-    normAndRope(elems, lane_id, eps, norm_w, do_rope, rotary_dim, cos_ptr, norm_w != nullptr);
-
-    if constexpr(kInsertKV)
-    {
-        if(is_q)
-        {
-            storeElems(store_ptr + dim_base, elems);
-        }
-        if constexpr(kProcessIndex)
-        {
-            if(is_iq)
-            {
-                storeIndexQElems(index_q_out,
-                                 index_q_fp8_out,
-                                 store_ptr + dim_base,
-                                 elems,
-                                 token_idx,
-                                 niq,
-                                 slot - iq_begin,
-                                 dim_base);
-            }
-        }
-
-        if(mapped_slot >= 0)
-        {
             if constexpr(kProcessIndex)
             {
-                if(is_ik)
+                if(is_iq)
                 {
-                    if constexpr(kIdxNvfp4)
+                    storeIndexQElems(index_q_out,
+                                     index_q_fp8_out,
+                                     store_ptr + dim_base,
+                                     elems,
+                                     token_idx,
+                                     niq,
+                                     slot - iq_begin,
+                                     dim_base);
+                }
+            }
+
+            if(mapped_slot >= 0)
+            {
+                if constexpr(kProcessIndex)
+                {
+                    if(is_ik)
+                    {
+                        if constexpr(kIdxNvfp4)
+                        {
+                            roundElems<scalar_t>(elems);
+                            storeIndexNvfp4(elems,
+                                            lane_id,
+                                            mapped_slot,
+                                            reinterpret_cast<uint8_t*>(index_cache),
+                                            idx_s_page,
+                                            idx_block);
+                        }
+                        else
+                        {
+                            storeCacheElemsPacked<scalar_t, index_cache_t, index_dt>(
+                                index_cache + mapped_slot * kHeadDim + dim_base, elems, 1.0f);
+                        }
+                    }
+                }
+                if constexpr(kKvNvfp4)
+                {
+                    if(is_k || is_v)
                     {
                         roundElems<scalar_t>(elems);
-                        storeIndexNvfp4(elems,
-                                        lane_id,
-                                        mapped_slot,
-                                        reinterpret_cast<uint8_t*>(index_cache),
-                                        idx_s_page,
-                                        idx_block);
+                        storeKvNvfp4(elems,
+                                     lane_id,
+                                     mapped_slot,
+                                     head,
+                                     reinterpret_cast<uint8_t*>(is_v ? kv_cache_v : kv_cache_k),
+                                     reinterpret_cast<uint8_t*>(kv_cache_k),
+                                     k_s_block,
+                                     k_s_head,
+                                     has_kv_scale,
+                                     kv_scale_val,
+                                     is_v);
+                    }
+                }
+                else if(is_k)
+                {
+                    // Per-token dynamic quant: amax over the lane's post-norm/rope K elems,
+                    // then a full-warp max -> the (token, head) head-dim amax.
+                    float k_scale_val = 1.0f;
+                    if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto &&
+                                 kPerTokenKVScale)
+                    {
+                        float local_amax = 0.0f;
+    #pragma unroll
+                        for(int i = 0; i < kElemsPerLane; ++i)
+                        {
+                            local_amax = fmaxf(local_amax, fabsf(elems[i]));
+                        }
+                        const float amax = warpReduceMax(local_amax);
+                        k_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
+                        if(lane_id == 0)
+                        {
+                            int64_t b, t;
+                            splitSlot(mapped_slot, block_size, b, t);
+                            const int64_t scale_idx =
+                                kAsmLayout
+                                    ? (b * (static_cast<int64_t>(nkv) * block_size) +
+                                       static_cast<int64_t>(head) * block_size + t)
+                                    : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
+                            k_scale[scale_idx] = k_scale_val;
+                        }
+                    }
+                    else if constexpr(kStaticKVScale)
+                    {
+                        k_scale_val = kv_scale_val;
+                    }
+                    if constexpr(kAsmLayout)
+                    {
+                        // K SHUFFLE: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+                        //   off(d) = b*(nkv*(hd/x)*bs*x) + h*((hd/x)*bs*x)
+                        //            + (d/x)*(bs*x) + t*x + (d%x)
+                        // kElemsPerLane <= x, so a lane's elements share d/x and (d%x) runs
+                        // contiguously -> a contiguous run of kElemsPerLane in the cache.
+                        int64_t b, t;
+                        splitSlot(mapped_slot, block_size, b, t);
+                        // x divides kHeadDim (host check): (hd/x)*bs*x == hd*bs.
+                        int64_t d_hi, d_lo;
+                        splitSlot(dim_base, x, d_hi, d_lo);
+                        const int64_t k_off =
+                            b * (static_cast<int64_t>(nkv) * kHeadDim * block_size) +
+                            static_cast<int64_t>(head) * (kHeadDim * block_size) +
+                            d_hi * (static_cast<int64_t>(block_size) * x) + t * x + d_lo;
+                        storeCacheElemsPacked<scalar_t, cache_t, kv_dt>(
+                            kv_cache_k + k_off, elems, k_scale_val);
                     }
                     else
                     {
-                        storeCacheElems<scalar_t, index_cache_t, index_dt>(
-                            index_cache + mapped_slot * kHeadDim + dim_base, elems, 1.0f);
+                        // page-128 K cache [num_blocks, block_size, num_kv_heads, head_dim]
+                        int64_t b, t;
+                        splitSlot(mapped_slot, block_size, b, t);
+                        const int64_t off = b * k_s_block + t * k_s_token + head * k_s_head;
+                        storeCacheElems<scalar_t, cache_t, kv_dt>(
+                            kv_cache_k + off + dim_base, elems, k_scale_val);
                     }
-                }
-            }
-            if constexpr(kKvNvfp4)
-            {
-                if(is_k || is_v)
-                {
-                    roundElems<scalar_t>(elems);
-                    storeKvNvfp4(elems,
-                                 lane_id,
-                                 mapped_slot,
-                                 head,
-                                 reinterpret_cast<uint8_t*>(is_v ? kv_cache_v : kv_cache_k),
-                                 reinterpret_cast<uint8_t*>(kv_cache_k),
-                                 k_s_block,
-                                 k_s_head,
-                                 has_kv_scale,
-                                 kv_scale_val,
-                                 is_v);
-                }
-            }
-            else if(is_k)
-            {
-                // Per-token dynamic quant: amax over the lane's post-norm/rope K elems,
-                // then a full-warp max -> the (token, head) head-dim amax.
-                float k_scale_val = 1.0f;
-                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto &&
-                             kPerTokenKVScale)
-                {
-                    float local_amax = 0.0f;
-#pragma unroll
-                    for(int i = 0; i < kElemsPerLane; ++i)
-                    {
-                        local_amax = fmaxf(local_amax, fabsf(elems[i]));
-                    }
-                    const float amax = warpReduceMax(local_amax);
-                    k_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
-                    if(lane_id == 0)
-                    {
-                        const int64_t b = mapped_slot / block_size;
-                        const int64_t t = mapped_slot % block_size;
-                        const int64_t scale_idx =
-                            kAsmLayout
-                                ? (b * (static_cast<int64_t>(nkv) * block_size) +
-                                   static_cast<int64_t>(head) * block_size + t)
-                                : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
-                        k_scale[scale_idx] = k_scale_val;
-                    }
-                }
-                else if constexpr(kStaticKVScale)
-                {
-                    k_scale_val = *k_scale;
-                }
-                if constexpr(kAsmLayout)
-                {
-                    // K SHUFFLE: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
-                    //   off(d) = b*(nkv*(hd/x)*bs*x) + h*((hd/x)*bs*x)
-                    //            + (d/x)*(bs*x) + t*x + (d%x)
-                    // kElemsPerLane <= x, so a lane's elements share d/x and (d%x) runs
-                    // contiguously -> a contiguous run of kElemsPerLane in the cache.
-                    const int64_t b = mapped_slot / block_size;
-                    const int64_t t = mapped_slot % block_size;
-                    const int d0 = dim_base;  // = lane_id * kElemsPerLane
-                    const int64_t k_off =
-                        b * (static_cast<int64_t>(nkv) * (kHeadDim / x) * block_size * x) +
-                        static_cast<int64_t>(head) * ((kHeadDim / x) * block_size * x) +
-                        static_cast<int64_t>(d0 / x) * (static_cast<int64_t>(block_size) * x) +
-                        t * x + (d0 % x);
-                    storeCacheElems<scalar_t, cache_t, kv_dt>(
-                        kv_cache_k + k_off, elems, k_scale_val);
-                }
-                else
-                {
-                    // page-128 K cache [num_blocks, block_size, num_kv_heads, head_dim]
-                    const int64_t b = mapped_slot / block_size;
-                    const int64_t t = mapped_slot % block_size;
-                    const int64_t off = b * k_s_block + t * k_s_token + head * k_s_head;
-                    storeCacheElems<scalar_t, cache_t, kv_dt>(
-                        kv_cache_k + off + dim_base, elems, k_scale_val);
                 }
             }
         }
+        else
+        {
+            if constexpr(kProcessIndex)
+            {
+                if(is_iq)
+                {
+                    storeIndexQElems(index_q_out,
+                                     index_q_fp8_out,
+                                     store_ptr + dim_base,
+                                     elems,
+                                     token_idx,
+                                     niq,
+                                     slot - iq_begin,
+                                     dim_base);
+                    return;
+                }
+            }
+            storeElems(store_ptr + dim_base, elems);
+        }
+    };
+
+    if((blockIdx.y + 1) * kSlotsPerBlock <= nq)
+    {
+        process(std::true_type{});
     }
     else
     {
-        if constexpr(kProcessIndex)
-        {
-            if(is_iq)
-            {
-                storeIndexQElems(index_q_out,
-                                 index_q_fp8_out,
-                                 store_ptr + dim_base,
-                                 elems,
-                                 token_idx,
-                                 niq,
-                                 slot - iq_begin,
-                                 dim_base);
-                return;
-            }
-        }
-        storeElems(store_ptr + dim_base, elems);
+        process(std::false_type{});
     }
 }
 
@@ -829,14 +1020,11 @@ void launchFusedQKNormIdxrQKNorm(
     const int v_slots = insert_kv ? nkv : 0;
     const int idx_slots = process_index ? niq + 1 : 0;
     const int slots_per_token = nq + nkv + v_slots + idx_slots;
-    constexpr int kBlockSize = 256;
-    constexpr int kWarpsPerBlock = kBlockSize / 32;
-    const int64_t total_warps = static_cast<int64_t>(num_tokens) * slots_per_token;
-    const int grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
-    if(grid == 0)
+    if(num_tokens == 0 || slots_per_token == 0)
     {
         return;
     }
+    const dim3 grid(num_tokens, (slots_per_token + kSlotsPerBlock - 1) / kSlotsPerBlock);
 
 #define LAUNCH(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE)               \
     fusedQKNormIdxrQKNormKernel<scalar_t,                                                    \
@@ -852,32 +1040,31 @@ void launchFusedQKNormIdxrQKNorm(
                                 ASM,                                                         \
                                 kKvNvfp4,                                                    \
                                 kIdxNvfp4>                                                   \
-        <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
-                                          q_out,                                             \
-                                          index_q_out,                                       \
-                                          index_q_fp8_out,                                   \
-                                          q_norm_w,                                          \
-                                          k_norm_w,                                          \
-                                          iq_norm_w,                                         \
-                                          ik_norm_w,                                         \
+        <<<grid, kBlockSize, 0, stream>>>(positions,                                         \
                                           cos_sin_cache,                                     \
-                                          positions,                                         \
-                                          slot_mapping,                                      \
-                                          index_slot_mapping,                                \
-                                          kv_cache_k,                                        \
-                                          kv_cache_v,                                        \
-                                          index_cache,                                       \
-                                          k_scale,                                           \
-                                          v_scale,                                           \
-                                          eps,                                               \
-                                          rotary_dim,                                        \
-                                          num_tokens,                                        \
+                                          qkv,                                               \
                                           nq,                                                \
                                           nkv,                                               \
                                           niq,                                               \
+                                          rotary_dim,                                        \
+                                          q_norm_w,                                          \
+                                          k_norm_w,                                          \
+                                          q_out,                                             \
+                                          iq_norm_w,                                         \
+                                          ik_norm_w,                                         \
+                                          k_scale,                                           \
+                                          v_scale,                                           \
+                                          slot_mapping,                                      \
+                                          index_slot_mapping,                                \
+                                          eps,                                               \
                                           block_size,                                        \
                                           x,                                                 \
                                           max_kv_tokens,                                     \
+                                          index_q_out,                                       \
+                                          index_q_fp8_out,                                   \
+                                          kv_cache_k,                                        \
+                                          kv_cache_v,                                        \
+                                          index_cache,                                       \
                                           k_s_block,                                         \
                                           k_s_token,                                         \
                                           k_s_head,                                          \
